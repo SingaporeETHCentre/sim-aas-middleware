@@ -1,0 +1,58 @@
+name: Pull Request Tests
+
+on: pull_request
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run Ruff
+        uses: astral-sh/ruff-action@v3
+
+  test:
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Ensure Docker is running
+        run: |
+          sudo systemctl start docker
+          sudo systemctl enable docker
+          docker --version
+
+      - name: Install dependencies
+        run: |
+          pip install -e ".[dev]"
+          pip install pytest-timeout pytest-cov
+
+      - name: Run tests with coverage
+        run: |
+          pytest -v --timeout=300 --cov --cov-report=xml --cov-report=term ./simaas/tests/test_unit_*.py
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+
+      - name: Upload coverage report
+        if: matrix.python-version == '3.13'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
