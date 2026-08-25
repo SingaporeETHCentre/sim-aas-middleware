@@ -59,6 +59,12 @@ class TaskChecklist:
     peers: List[NodeInfo]
     job: Optional[Job]
     status: Optional[JobStatus]
+    # False when a single-job submission's namespace reservation could not be
+    # satisfied at submit time: the job stays UNINITIALISED in the DB and is
+    # picked up later by _try_dequeue when budget becomes available. Batches
+    # cannot be queued (they must launch together) and always end up True or
+    # cause submission to fail.
+    reserved: bool = True
 
 
 class RTIServiceBase(RTIRESTService):
@@ -88,6 +94,10 @@ class RTIServiceBase(RTIRESTService):
         self._cleanup_workers: Dict[str, Optional[asyncio.Task]] = {}
         self._deploy_workers: Dict[str, Optional[asyncio.Task]] = {}
         self._undeploy_workers: Dict[str, Optional[asyncio.Task]] = {}
+
+        # per-namespace asyncio locks that serialise the queue-drain loop; created lazily
+        self._dequeue_locks: Dict[str, asyncio.Lock] = {}
+        self._dequeue_locks_mutex = threading.Lock()
 
     def on_cancellation_worker_done(self, job_id: str) -> None:
         # we keep the dict entry but remove the thread object
@@ -383,6 +393,106 @@ class RTIServiceBase(RTIRESTService):
             # send the cancel message to all nodes in the network
             await self._node.db.cancel_namespace_reservation(checklist.task.namespace, checklist.job_id)
 
+    async def resume_queued_jobs(self) -> None:
+        """
+        Called once at node startup: scan the job DB for any UNINITIALISED single-jobs that
+        never got a container_id (they were queued when the node last stopped) and drain
+        their namespaces. Batches are never queued, so this only concerns single jobs.
+        """
+        namespaces: Set[str] = set()
+        with self._session_maker() as session:
+            for record in session.query(DBJobInfo).filter_by(batch_id=None).all():
+                if record.status.get('state') != JobStatus.State.UNINITIALISED.value:
+                    continue
+                if record.runner.get('container_id') is not None:
+                    continue
+                ns = (record.job.get('task') or {}).get('namespace')
+                if ns:
+                    namespaces.add(ns)
+        for ns in namespaces:
+            log.info('queue', 'resuming queued jobs after startup', namespace=ns)
+            await self._try_dequeue(ns)
+
+    def _get_dequeue_lock(self, namespace: str) -> asyncio.Lock:
+        with self._dequeue_locks_mutex:
+            lock = self._dequeue_locks.get(namespace)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._dequeue_locks[namespace] = lock
+            return lock
+
+    def _find_next_queued_job(self, namespace: str, reserved_job_ids: Set[str]) -> Optional[Job]:
+        """Return the oldest single-job that is UNINITIALISED, unreserved, no container yet."""
+        best: Optional[Tuple[int, Job]] = None
+        with self._session_maker() as session:
+            records = session.query(DBJobInfo).filter_by(batch_id=None).all()
+            for record in records:
+                if record.id in reserved_job_ids:
+                    continue
+                if record.runner.get('container_id') is not None:
+                    continue
+                if record.status.get('state') != JobStatus.State.UNINITIALISED.value:
+                    continue
+                task = record.job.get('task') or {}
+                if task.get('namespace') != namespace:
+                    continue
+                job = Job.model_validate(record.job)
+                if best is None or job.t_submitted < best[0]:
+                    best = (job.t_submitted, job)
+        return best[1] if best else None
+
+    async def _try_dequeue(self, namespace: str) -> None:
+        """
+        Called whenever a namespace reservation is released (job completion, cancellation,
+        submission rollback). Walks the queued single-jobs for that namespace in FIFO order
+        and spawns as many as the freed budget can now admit. Head-of-line block: if the
+        oldest queued job still doesn't fit, we stop rather than skip ahead.
+        """
+        async with self._get_dequeue_lock(namespace):
+            while True:
+                ns_info = await self._node.db.get_namespace(namespace)
+                if ns_info is None:
+                    return  # namespace deleted; nothing to do
+                reserved = set(ns_info.reservations.keys())
+
+                job = self._find_next_queued_job(namespace, reserved)
+                if job is None:
+                    return
+
+                proc = await self.get_proc(job.task.proc_id)
+                if proc is None:
+                    log.warning('queue', 'processor gone; failing queued job',
+                                job=job.id, proc_id=job.task.proc_id, namespace=namespace)
+                    failed = JobStatus(
+                        state=JobStatus.State.FAILED, progress=0, output={}, notes={},
+                        errors=[JobStatus.Error(
+                            message='Processor no longer deployed',
+                            exception=ExceptionContent(
+                                id='none', reason='proc_undeployed',
+                                details={'proc_id': job.task.proc_id},
+                            ),
+                        )],
+                        message=None,
+                    )
+                    await self.update_job_status(job.id, failed)
+                    continue
+
+                ok = await self._node.db.reserve_namespace_resources(
+                    namespace, job.id, job.task.budget, raise_on_fail=False,
+                )
+                if not ok:
+                    return  # head-of-line block: oldest doesn't fit, don't skip
+
+                try:
+                    self.perform_submit_single(job, proc)
+                    log.info('queue', 'dequeued and spawned', job=job.id, namespace=namespace)
+                except Exception as e:
+                    # roll back the reservation we just made so the queue can retry later
+                    await self._node.db.cancel_namespace_reservation(namespace, job.id)
+                    log.error('queue', 'spawn failed for dequeued job',
+                              job=job.id, namespace=namespace, exc=e)
+                    return
+
     async def check_submitted_tasks(self, tasks: List[Task]) -> List[TaskChecklist]:
         # create the checklists for each task
         checklists: List[TaskChecklist] = []
@@ -507,13 +617,43 @@ class RTIServiceBase(RTIRESTService):
         return checklists
 
     async def prepare_job_execution(self, batch_id: Optional[str], checklists: List[TaskChecklist]) -> None:
-        # try to make reservations for all tasks that require it
-        for checklist in checklists:
-            # does the task require a resource reservation?
-            if checklist.task.namespace is not None:
-                await self._node.db.reserve_namespace_resources(
-                    checklist.task.namespace, checklist.job_id, checklist.task.budget
+        # reserve namespace resources:
+        #  - batch (batch_id != None): must be atomic. Try to reserve every task; on any failure
+        #    roll back partial reservations and raise so the whole batch is rejected.
+        #  - single job (batch_id is None): try to reserve, but if the namespace is currently full
+        #    leave it unreserved. The job stays UNINITIALISED with no container_id and will be
+        #    dequeued later when a running job releases its reservation.
+        if batch_id is not None:
+            granted: List[Tuple[str, str]] = []
+            for checklist in checklists:
+                if checklist.task.namespace is None:
+                    continue
+                ok = await self._node.db.reserve_namespace_resources(
+                    checklist.task.namespace, checklist.job_id, checklist.task.budget,
+                    raise_on_fail=False,
                 )
+                if not ok:
+                    # roll back the reservations we already made for earlier batch members
+                    for ns, jid in granted:
+                        await self._node.db.cancel_namespace_reservation(ns, jid)
+                    raise OperationError(
+                        operation='reserve_namespace', stage='batch_reservation',
+                        cause=f"namespace '{checklist.task.namespace}' cannot admit batch {batch_id} right now",
+                    )
+                granted.append((checklist.task.namespace, checklist.job_id))
+        else:
+            checklist = checklists[0]
+            if checklist.task.namespace is not None:
+                ok = await self._node.db.reserve_namespace_resources(
+                    checklist.task.namespace, checklist.job_id, checklist.task.budget,
+                    raise_on_fail=False,
+                )
+                checklist.reserved = ok
+                if not ok:
+                    log.info(
+                        'queue', 'namespace budget exhausted, job queued',
+                        job=checklist.job_id, namespace=checklist.task.namespace,
+                    )
 
         # try to prepare the job for each task
         for checklist in checklists:
@@ -566,8 +706,9 @@ class RTIServiceBase(RTIRESTService):
         error, trace = None, None
         try:
             if len(checklists) == 1:
-                # perform submission of the single task
-                self.perform_submit_single(batch[0][0], batch[0][2])
+                # single job: skip spawn if the job is queued (no reservation held)
+                if checklists[0].reserved:
+                    self.perform_submit_single(batch[0][0], batch[0][2])
 
             else:
                 # perform submission of the batch of tasks
@@ -607,6 +748,10 @@ class RTIServiceBase(RTIRESTService):
 
             # cancel resource reservations (if any left for whatever reason)
             await self.cancel_resource_reservations(checklists)
+
+            # give the queue a chance to drain into the budget we just freed
+            for ns in {c.task.namespace for c in checklists if c.task.namespace is not None}:
+                await self._try_dequeue(ns)
 
             raise OperationError(operation='batch_submit', stage='submission', cause=f'batch {batch_id} failed')
 
@@ -784,6 +929,8 @@ class RTIServiceBase(RTIRESTService):
         # Async operations - outside any lock
         if namespace_to_cancel:
             await self._node.db.cancel_namespace_reservation(namespace_to_cancel[0], namespace_to_cancel[1])
+            # freed budget in this namespace -> try to spawn the next queued single job(s)
+            await self._try_dequeue(namespace_to_cancel[0])
 
         if job_to_cleanup:
             task = asyncio.create_task(self.perform_job_cleanup(job_to_cleanup))

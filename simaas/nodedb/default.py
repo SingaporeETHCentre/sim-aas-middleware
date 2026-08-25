@@ -339,7 +339,8 @@ class DefaultNodeDBService(NodeDBService):
 
         return ns_info
 
-    async def reserve_namespace_resources(self, name: str, job_id: str, resources: ResourceDescriptor) -> None:
+    async def reserve_namespace_resources(self, name: str, job_id: str, resources: ResourceDescriptor,
+                                          raise_on_fail: bool = True) -> bool:
         # try to make a resource reservation
         successful = True
         for peer in await self._node.db.get_network():
@@ -362,7 +363,11 @@ class DefaultNodeDBService(NodeDBService):
                 else:
                     await P2PCancelNamespaceReservation.perform(self._node, peer, name, job_id)
 
-            raise OperationError(operation='reserve_namespace', stage='reservation', cause=f'{name}:{job_id} failed')
+            if raise_on_fail:
+                raise OperationError(operation='reserve_namespace', stage='reservation', cause=f'{name}:{job_id} failed')
+            return False
+
+        return True
 
     async def cancel_namespace_reservation(self, name: str, job_id: str) -> bool:
         result = await self.handle_namespace_cancellation(name, job_id)

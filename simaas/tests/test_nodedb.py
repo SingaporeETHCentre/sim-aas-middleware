@@ -475,3 +475,37 @@ async def test_namespace_reserve_cancel(test_context):
     assert await nodes[0].db.cancel_namespace_reservation(namespace, "job002") is True
     for node in nodes:
         assert len((await node.db.get_namespace(namespace)).reservations) == 0
+
+
+@pytest.mark.asyncio
+async def test_namespace_reserve_non_raising(test_context):
+    """reserve_namespace_resources(raise_on_fail=False) returns True/False instead of raising."""
+    namespace = 'ns_non_raising'
+    budget = ResourceDescriptor(vcpus=2, memory=2048)
+
+    keystore = Keystore.new("keystore_nr", "email")
+    node = test_context.get_node(
+        keystore, enable_rest=True, dor_plugin_class=FilesystemDORService, rti_plugin_class=None
+    )
+    await node.db.update_namespace_budget(namespace, budget)
+
+    # first reservation fits -> True, and it's recorded
+    ok = await node.db.reserve_namespace_resources(
+        namespace, "j1", ResourceDescriptor(vcpus=1, memory=1024), raise_on_fail=False
+    )
+    assert ok is True
+    assert "j1" in (await node.db.get_namespace(namespace)).reservations
+
+    # second reservation exceeds remaining budget -> False, and no side effect
+    ok = await node.db.reserve_namespace_resources(
+        namespace, "j2", ResourceDescriptor(vcpus=2, memory=2048), raise_on_fail=False
+    )
+    assert ok is False
+    assert "j2" not in (await node.db.get_namespace(namespace)).reservations
+
+    # default behaviour still raises so callers who never adopt the queue keep working
+    with pytest.raises(OperationError):
+        await node.db.reserve_namespace_resources(
+            namespace, "j3", ResourceDescriptor(vcpus=2, memory=2048)
+        )
+    assert "j3" not in (await node.db.get_namespace(namespace)).reservations
