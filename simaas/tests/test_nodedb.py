@@ -509,3 +509,43 @@ async def test_namespace_reserve_non_raising(test_context):
             namespace, "j3", ResourceDescriptor(vcpus=2, memory=2048)
         )
     assert "j3" not in (await node.db.get_namespace(namespace)).reservations
+
+
+@pytest.mark.integration
+def test_rest_concurrent_gets(module_node, module_nodedb_proxy):
+    """
+    Regression test: async handlers that ran sync SQLite queries directly on
+    the event loop would stall uvicorn's accept-loop under bursty concurrent
+    load. The OS TCP backlog (kern.ipc.somaxconn=128 on macOS) would then
+    silently drop excess SYNs, causing clients to fail before ever reaching
+    the server. All async DB handlers now dispatch their SQL work via
+    asyncio.to_thread so the accept-loop never blocks.
+
+    This test fires N HTTP requests in parallel against the same endpoints the
+    scale-up demo hammers (identity, network, identities) and asserts every
+    single one succeeds.
+    """
+    import concurrent.futures
+    from simaas.core.errors import RemoteError
+
+    n = 200
+    endpoints = [
+        module_nodedb_proxy.get_identities,
+        module_nodedb_proxy.get_network,
+        lambda: module_nodedb_proxy.get_identity(module_node.identity.id),
+    ]
+
+    def one_call(i: int):
+        try:
+            return endpoints[i % len(endpoints)]()
+        except (RemoteError, Exception) as e:  # capture *any* client-side failure
+            return e
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+        results = list(pool.map(one_call, range(n)))
+
+    failures = [(i, r) for i, r in enumerate(results) if isinstance(r, Exception)]
+    assert not failures, (
+        f"{len(failures)}/{n} concurrent REST requests failed. First 3: "
+        f"{failures[:3]}"
+    )
