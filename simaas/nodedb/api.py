@@ -127,9 +127,12 @@ class NodeDBService(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def reserve_namespace_resources(self, name: str, job_id: str, resources: ResourceDescriptor) -> None:
+    async def reserve_namespace_resources(self, name: str, job_id: str, resources: ResourceDescriptor,
+                                          raise_on_fail: bool = True) -> bool:
         """
-        Attempts to reserve namespace resources for a job.
+        Attempts to reserve namespace resources for a job. When raise_on_fail is True (default), raises
+        OperationError if the reservation cannot be satisfied; when False, returns False instead so the
+        caller can decide (e.g. leave the job queued). Returns True on success.
         """
 
     @abc.abstractmethod

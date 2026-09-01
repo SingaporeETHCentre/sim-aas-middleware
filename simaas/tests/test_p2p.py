@@ -510,3 +510,80 @@ async def test_p2p_relay_push_target_is_custodian(p2p_server, p2p_client):
         custodian_meta = await p2p_server.dor.get_meta(meta.obj_id)
         assert custodian_meta is not None
         assert custodian_meta.obj_id == meta.obj_id
+
+
+# ==============================================================================
+# P2P concurrency tests
+# ==============================================================================
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_p2p_concurrent_requests_no_starvation(p2p_server, p2p_client):
+    """Fire N concurrent requests against one server and assert all complete.
+
+    Regression test for the bug where the P2P server processed requests
+    serially: a burst of concurrent handshakes from spawned containers
+    would time out because each was waiting behind the ones ahead of it.
+    Under concurrent dispatch, the server should service all N requests in
+    parallel (up to its semaphore cap) and none should raise NetworkError.
+    """
+    peer = P2PAddress(
+        address=p2p_server.p2p.address(),
+        curve_secret_key=p2p_client.keystore.curve_secret_key(),
+        curve_public_key=p2p_client.keystore.curve_public_key(),
+        curve_server_key=p2p_server.identity.c_public_key,
+    )
+
+    # 32 in parallel - well above the 14-way container spawn that triggered
+    # the original deadlock, still well below the 64-permit handler cap.
+    n = 32
+    results = await asyncio.gather(
+        *[P2PLatency.perform(peer, max_attempts=3) for _ in range(n)],
+        return_exceptions=True,
+    )
+
+    failures = [(i, r) for i, r in enumerate(results) if isinstance(r, Exception)]
+    assert not failures, f"{len(failures)}/{n} concurrent requests failed: {failures[:3]}"
+
+    latencies_ms = [pair[0] for pair in results]
+    log.info(f"32 concurrent P2P requests: latencies={[f'{x:.0f}ms' for x in sorted(latencies_ms)]}")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_p2p_slow_handler_does_not_block_fast(p2p_server, p2p_client):
+    """A slow (large-payload) request must not delay a subsequent small one.
+
+    With serial handling, the throughput-test request (upload+download of
+    several MB) would hold the socket for its whole duration and every
+    other client would wait for it. With concurrent handling, a small
+    latency probe fired 100ms after the throughput probe should return
+    well before the throughput probe does.
+    """
+    peer = P2PAddress(
+        address=p2p_server.p2p.address(),
+        curve_secret_key=p2p_client.keystore.curve_secret_key(),
+        curve_public_key=p2p_client.keystore.curve_public_key(),
+        curve_server_key=p2p_server.identity.c_public_key,
+    )
+
+    # 20 MB throughput probe (upload + download) will run for at least
+    # several hundred ms even on localhost.
+    slow_task = asyncio.create_task(P2PThroughput.perform(peer, 20 * 1024 * 1024))
+    await asyncio.sleep(0.1)   # let it start
+
+    t0 = asyncio.get_event_loop().time()
+    fast_latency, _ = await P2PLatency.perform(peer, max_attempts=3)
+    fast_elapsed_ms = (asyncio.get_event_loop().time() - t0) * 1000
+
+    # Wait for the slow one so we can compare
+    upload, download, _ = await slow_task
+    slow_total_ms = 20 * 1024 / (upload + 1e-9) * 1000 + 20 * 1024 / (download + 1e-9) * 1000
+
+    log.info(f"fast probe: {fast_elapsed_ms:.0f}ms; slow probe: {slow_total_ms:.0f}ms")
+    # Fast probe should complete in a small fraction of the slow one's total.
+    # Even a modest concurrency benefit makes this ratio << 1.
+    assert fast_elapsed_ms < slow_total_ms / 2, (
+        f"fast probe took {fast_elapsed_ms:.0f}ms, slow probe {slow_total_ms:.0f}ms - "
+        "server may be serialising handlers"
+    )

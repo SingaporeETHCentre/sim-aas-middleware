@@ -122,6 +122,10 @@ class Node(abc.ABC):
             strict_deployment=self.rti.strict_deployment if self.rti else None
         ))
 
+        # give the RTI a chance to resume any queued single-jobs that survived from a prior run
+        if self.rti:
+            await self.rti.resume_queued_jobs()
+
     def shutdown(self) -> None:
         """
         Stop the node's daemon services (P2P, REST).

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -131,8 +132,12 @@ class FilesystemDORService(DORRESTService):
         self._node = node
         self._parts = {}
 
-        # initialise database things
-        self._engine = create_engine(db_path)
+        # initialise database things. SQLite needs check_same_thread=False so
+        # pooled connections can be used from asyncio.to_thread worker threads
+        # (async handlers dispatch their SQL work off the event loop to avoid
+        # starving REST accepts under bursty concurrent load).
+        _connect_args = {"check_same_thread": False} if db_path.startswith("sqlite") else {}
+        self._engine = create_engine(db_path, connect_args=_connect_args)
         Base.metadata.create_all(self._engine)
         self._Session = sessionmaker(bind=self._engine)
 
@@ -244,7 +249,7 @@ class FilesystemDORService(DORRESTService):
                 # when adding a data object to the DOR. let's generate provenance information for this by-value
                 # object on the fly
                 provenance = _generate_by_value_provenance(obj.c_hash, obj.data_type, obj.data_format, obj.content)
-                self._add_provenance_record(obj.c_hash, provenance.model_dump())
+                await asyncio.to_thread(self._add_provenance_record, obj.c_hash, provenance.model_dump())
 
                 # add to step
                 step['consumes'][name] = obj.c_hash
@@ -286,50 +291,42 @@ class FilesystemDORService(DORRESTService):
         patterns is matched, the data object is included in the final result set. Search patterns are applied to the
         data object tags only. A search pattern is considered matched if it is a substring of either tag key or value.
         """
-        with self._Session() as session:
-            # build the query and get the results
-            q = session.query(DataObjectRecord)
+        def _sync() -> List[DataObject]:
+            with self._Session() as session:
+                q = session.query(DataObjectRecord)
+                if owner_iid is not None:
+                    q = q.filter(DataObjectRecord.owner_iid == owner_iid)
+                if data_type is not None:
+                    q = q.filter(DataObjectRecord.data_type == data_type)
+                if data_format is not None:
+                    q = q.filter(DataObjectRecord.data_format == data_format)
+                if c_hashes is not None:
+                    q = q.filter(DataObjectRecord.c_hash.in_(c_hashes))
 
-            # first, apply the search constraints (if any)
-            if owner_iid is not None:
-                q = q.filter(DataObjectRecord.owner_iid == owner_iid)
+                object_records: list[DataObjectRecord] = q.all()
 
-            if data_type is not None:
-                q = q.filter(DataObjectRecord.data_type == data_type)
-
-            if data_format is not None:
-                q = q.filter(DataObjectRecord.data_format == data_format)
-
-            if c_hashes is not None:
-                q = q.filter(DataObjectRecord.c_hash.in_(c_hashes))
-
-            object_records: list[DataObjectRecord] = q.all()
-
-            # second, apply the search patterns (if any)
-            result = []
-            for record in object_records:
-                # flatten all tags (keys values) into a single string for search purposes
-                flattened = ' '.\
-                    join(f"{key} {json.dumps(value) if isinstance(value, (list, dict)) else value}"
-                         for key, value in record.tags.items())
-
-                # check if any of the patterns is a substring the flattened string.
-                # if we don't have patterns then always add the object.
-                if patterns is None or any(pattern in flattened for pattern in patterns):
-                    # convert into an C/GPP data object and add to the result
-                    result.append(_extract_data_object(record, self._node.info))
-
-            return result
+                result: List[DataObject] = []
+                for record in object_records:
+                    flattened = ' '.join(
+                        f"{key} {json.dumps(value) if isinstance(value, (list, dict)) else value}"
+                        for key, value in record.tags.items()
+                    )
+                    if patterns is None or any(pattern in flattened for pattern in patterns):
+                        result.append(_extract_data_object(record, self._node.info))
+                return result
+        return await asyncio.to_thread(_sync)
 
     async def statistics(self) -> DORStatistics:
         """
         Retrieves some statistics from the DOR. This includes a list of all data types and formats found in the DOR.
         """
-        with self._Session() as session:
-            return DORStatistics(
-                data_types=[value[0] for value in session.query(DataObjectRecord.data_type).distinct()],
-                data_formats=[value[0] for value in session.query(DataObjectRecord.data_format).distinct()]
-            )
+        def _sync() -> DORStatistics:
+            with self._Session() as session:
+                return DORStatistics(
+                    data_types=[value[0] for value in session.query(DataObjectRecord.data_type).distinct()],
+                    data_formats=[value[0] for value in session.query(DataObjectRecord.data_format).distinct()]
+                )
+        return await asyncio.to_thread(_sync)
 
     async def add(
             self, content_path: str, data_type: str, data_format: str, owner_iid: str,
@@ -362,47 +359,43 @@ class FilesystemDORService(DORRESTService):
         created_t = get_timestamp_now()
         obj_id = hash_string_object(f"{c_hash}{data_type}{data_format}{''.join(creators_iid)}{created_t}").hex()
 
-        with self._db_mutex:
-            with self._Session() as session:
-                # check if there are already data objects with the same content (i.e., referencing the same c_hash).
-                # it is possible for cases like this to happen. despite the exact same content, this may well be
-                # a legitimate different data object. for example, different provenance has led to the exact same
-                # outcome. we thus create a new data object.
-                records = session.query(DataObjectRecord).filter_by(c_hash=c_hash).all()
-                if len(records) > 0:
-                    # delete the temporary content as it is not needed
-                    os.remove(content_path)
+        # DB write + local filesystem move under the db mutex — offloaded so
+        # the event loop stays free to accept new HTTP requests. Filesystem
+        # shutil.copyfile can be slow for large attachments.
+        def _sync_persist() -> None:
+            with self._db_mutex:
+                with self._Session() as session:
+                    records = session.query(DataObjectRecord).filter_by(c_hash=c_hash).all()
+                    if len(records) > 0:
+                        os.remove(content_path)
+                    else:
+                        destination_path = self.obj_content_path(c_hash)
+                        shutil.copyfile(content_path, destination_path)
+                        os.remove(content_path)
+                        os.chmod(destination_path, S_IREAD | S_IRGRP)
 
-                else:
-                    # move the temporary content to its destination and make it read-only
-                    # Note: emulate move by copy + delete to avoid cross-device move issues
-                    destination_path = self.obj_content_path(c_hash)
-                    shutil.copyfile(content_path, destination_path)
-                    os.remove(content_path)
-                    os.chmod(destination_path, S_IREAD | S_IRGRP)
-
-                # create a new data object record
-                session.add(DataObjectRecord(obj_id=obj_id, c_hash=c_hash,
-                                             data_type=data_type, data_format=data_format,
-                                             created={
-                                                 'timestamp': created_t,
-                                                 'creators_iid': creators_iid
-                                             },
-                                             owner_iid=owner.id, access_restricted=access_restricted,
-                                             access=[owner.id], tags=tags if tags else {},
-                                             details={
-                                                 'content_encrypted': content_encrypted,
-                                                 'license': license.model_dump() if license else None,
-                                                 'recipe': recipe.model_dump() if recipe else None,
-                                             },
-                                             last_accessed=created_t))
-                session.commit()
-                log.info('add', 'Data object added to DOR', obj=obj_id, c_hash=c_hash, ref_count=len(records))
+                    session.add(DataObjectRecord(obj_id=obj_id, c_hash=c_hash,
+                                                 data_type=data_type, data_format=data_format,
+                                                 created={
+                                                     'timestamp': created_t,
+                                                     'creators_iid': creators_iid
+                                                 },
+                                                 owner_iid=owner.id, access_restricted=access_restricted,
+                                                 access=[owner.id], tags=tags if tags else {},
+                                                 details={
+                                                     'content_encrypted': content_encrypted,
+                                                     'license': license.model_dump() if license else None,
+                                                     'recipe': recipe.model_dump() if recipe else None,
+                                                 },
+                                                 last_accessed=created_t))
+                    session.commit()
+                    log.info('add', 'Data object added to DOR', obj=obj_id, c_hash=c_hash, ref_count=len(records))
+        await asyncio.to_thread(_sync_persist)
 
         # determine the provenance and add to the database
         provenance = await self._generate_provenance_information(c_hash, recipe) if recipe else \
             _generate_missing_provenance(c_hash, data_type, data_format)
-        self._add_provenance_record(c_hash, provenance.model_dump())
+        await asyncio.to_thread(self._add_provenance_record, c_hash, provenance.model_dump())
 
         return await self.get_meta(obj_id)
 
@@ -493,19 +486,17 @@ class FilesystemDORService(DORRESTService):
         if meta is None:
             return None
 
-        # delete the data object
-        with self._db_mutex:
-            with self._Session() as session:
-                # delete the database record only (we do not delete the provenance information)
-                session.query(DataObjectRecord).filter_by(obj_id=obj_id).delete()
-                session.commit()
-
-        # if it's a content data object, we need to check if there are other data objects that point to the same
-        # content (unlikely but not impossible).
-        with self._db_mutex:
-            with self._Session() as session:
-                referenced = session.query(DataObjectRecord).filter_by(c_hash=meta.c_hash).all()
-                referenced = [record.obj_id for record in referenced]
+        # delete the data object (offloaded so sync SQL doesn't stall the loop)
+        def _sync_delete_and_check() -> List[str]:
+            with self._db_mutex:
+                with self._Session() as session:
+                    session.query(DataObjectRecord).filter_by(obj_id=obj_id).delete()
+                    session.commit()
+                # separate txn: check remaining references to the same content
+                with self._Session() as session:
+                    referenced = session.query(DataObjectRecord).filter_by(c_hash=meta.c_hash).all()
+                    return [record.obj_id for record in referenced]
+        referenced = await asyncio.to_thread(_sync_delete_and_check)
 
         # only delete if we have not found any other data objects that reference this content.
         if len(referenced) == 0:
@@ -523,14 +514,13 @@ class FilesystemDORService(DORRESTService):
         `CDataObject` or a `GPPDataObject` is returned, providing meta information for content and GPP data objects,
         respectively.
         """
-        with self._Session() as session:
-            # do we have an object with this id?
-            record: DataObjectRecord = session.get(DataObjectRecord, obj_id)
-            if record is None:
-                return None
-
-            # is it a GPP data object?
-            return _extract_data_object(record, self._node.info)
+        def _sync() -> Optional[DataObject]:
+            with self._Session() as session:
+                record: DataObjectRecord = session.get(DataObjectRecord, obj_id)
+                if record is None:
+                    return None
+                return _extract_data_object(record, self._node.info)
+        return await asyncio.to_thread(_sync)
 
     async def get_content(self, obj_id: str, content_path: str) -> None:
         # get the meta information for this object (if it exists in the first place)
@@ -544,8 +534,8 @@ class FilesystemDORService(DORRESTService):
             raise NotFoundError(resource_type='data_object_content', resource_id=obj_id,
                                 searched_locations=[content_path0])
 
-        # touch data object
-        self.touch_data_object(obj_id)
+        # touch data object (offload sync DB access from the event loop)
+        await asyncio.to_thread(self.touch_data_object, obj_id)
 
         # make sym link
         if os.path.isfile(content_path):
@@ -568,8 +558,8 @@ class FilesystemDORService(DORRESTService):
             raise NotFoundError(resource_type='data_object_content', resource_id=obj_id,
                                 searched_locations=[content_path])
 
-        # touch data object
-        self.touch_data_object(obj_id)
+        # touch data object (offload sync DB access from the event loop)
+        await asyncio.to_thread(self.touch_data_object, obj_id)
 
         async def file_iterator(file_path, chunk_size: int):
             with open(file_path, "rb") as file:
@@ -588,37 +578,35 @@ class FilesystemDORService(DORRESTService):
         situation is likely to be rare. However, careful analysis of the provenance information might be needed to
         understand how the content has been created.
         """
-        with self._Session() as session:
-            # do we have an object with this id?
-            records: list[DataObjectProvenanceRecord] = session.query(DataObjectProvenanceRecord).filter(
-                (DataObjectProvenanceRecord.c_hash == c_hash)).all()
-            return DataObjectProvenance.model_validate(records[0].provenance) if records else None
+        def _sync() -> Optional[DataObjectProvenance]:
+            with self._Session() as session:
+                records: list[DataObjectProvenanceRecord] = session.query(DataObjectProvenanceRecord).filter(
+                    (DataObjectProvenanceRecord.c_hash == c_hash)).all()
+                return DataObjectProvenance.model_validate(records[0].provenance) if records else None
+        return await asyncio.to_thread(_sync)
 
     async def grant_access(self, obj_id: str, user_iid: str) -> DataObject:
         """
         Grants a user the right to access the contents of a restricted data object. Authorisation required by the owner
         of the data object. Note that access rights only matter if the data object has access restrictions.
         """
-        # do we have an identity for this iid?
         user = await self._node.db.get_identity(user_iid)
         if user is None:
             raise NotFoundError(resource_type='identity', resource_id=user_iid)
 
-        with self._db_mutex:
-            with self._Session() as session:
-                # do we have an object with this id?
-                record: DataObjectRecord = session.get(DataObjectRecord, obj_id)
-                if record is None:
-                    raise NotFoundError(resource_type='data_object', resource_id=obj_id)
+        def _sync() -> None:
+            with self._db_mutex:
+                with self._Session() as session:
+                    record: DataObjectRecord = session.get(DataObjectRecord, obj_id)
+                    if record is None:
+                        raise NotFoundError(resource_type='data_object', resource_id=obj_id)
+                    if user_iid not in record.access:
+                        record.access.append(user_iid)
+                        session.commit()
+        await asyncio.to_thread(_sync)
 
-                # grant access
-                if user_iid not in record.access:
-                    record.access.append(user_iid)
-                    session.commit()
-
-        # touch data object
-        self.touch_data_object(obj_id)
-
+        # touch data object (sync)
+        await asyncio.to_thread(self.touch_data_object, obj_id)
         return await self.get_meta(obj_id)
 
     async def revoke_access(self, obj_id: str, user_iid: str) -> DataObject:
@@ -626,26 +614,22 @@ class FilesystemDORService(DORRESTService):
         Revokes the right to access the contents of a restricted data object from a user. Authorisation required by the
         owner of the data object. Note that access rights only matter if the data object has access restrictions.
         """
-        # do we have an identity for this iid?
         user = await self._node.db.get_identity(user_iid)
         if user is None:
             raise NotFoundError(resource_type='identity', resource_id=user_iid)
 
-        with self._db_mutex:
-            with self._Session() as session:
-                # do we have an object with this id?
-                record: DataObjectRecord = session.get(DataObjectRecord, obj_id)
-                if record is None:
-                    raise NotFoundError(resource_type='data_object', resource_id=obj_id)
+        def _sync() -> None:
+            with self._db_mutex:
+                with self._Session() as session:
+                    record: DataObjectRecord = session.get(DataObjectRecord, obj_id)
+                    if record is None:
+                        raise NotFoundError(resource_type='data_object', resource_id=obj_id)
+                    if user_iid in record.access:
+                        record.access.remove(user_iid)
+                    session.commit()
+        await asyncio.to_thread(_sync)
 
-                # revoke access
-                if user_iid in record.access:
-                    record.access.remove(user_iid)
-                session.commit()
-
-        # touch data object
-        self.touch_data_object(obj_id)
-
+        await asyncio.to_thread(self.touch_data_object, obj_id)
         return await self.get_meta(obj_id)
 
     async def transfer_ownership(self, obj_id: str, new_owner_iid: str) -> DataObject:
@@ -653,25 +637,21 @@ class FilesystemDORService(DORRESTService):
         Transfers the ownership of a data object to another user. Authorisation required by the current owner of the
         data object.
         """
-        # do we have an identity for this iid?
         new_owner = await self._node.db.get_identity(new_owner_iid)
         if new_owner is None:
             raise NotFoundError(resource_type='identity', resource_id=new_owner_iid)
 
-        with self._db_mutex:
-            with self._Session() as session:
-                # do we have an object with this id?
-                record: DataObjectRecord = session.get(DataObjectRecord, obj_id)
-                if record is None:
-                    raise NotFoundError(resource_type='data_object', resource_id=obj_id)
+        def _sync() -> None:
+            with self._db_mutex:
+                with self._Session() as session:
+                    record: DataObjectRecord = session.get(DataObjectRecord, obj_id)
+                    if record is None:
+                        raise NotFoundError(resource_type='data_object', resource_id=obj_id)
+                    record.owner_iid = new_owner_iid
+                    session.commit()
+        await asyncio.to_thread(_sync)
 
-                # transfer ownership
-                record.owner_iid = new_owner_iid
-                session.commit()
-
-        # touch data object
-        self.touch_data_object(obj_id)
-
+        await asyncio.to_thread(self.touch_data_object, obj_id)
         return await self.get_meta(obj_id)
 
     async def update_tags(self, obj_id: str, tags: List[DataObject.Tag]) -> DataObject:
@@ -679,53 +659,46 @@ class FilesystemDORService(DORRESTService):
         Adds tags to a data object or updates tags in case they already exist. Authorisation required by the owner of
         the data object.
         """
-        with self._db_mutex:
-            with self._Session() as session:
-                # do we have an object with this id?
-                record: DataObjectRecord = session.get(DataObjectRecord, obj_id)
-                if record is None:
-                    raise NotFoundError(resource_type='data_object', resource_id=obj_id)
+        def _sync() -> None:
+            with self._db_mutex:
+                with self._Session() as session:
+                    record: DataObjectRecord = session.get(DataObjectRecord, obj_id)
+                    if record is None:
+                        raise NotFoundError(resource_type='data_object', resource_id=obj_id)
+                    for tag in tags:
+                        record.tags[tag.key] = tag.value if tag.value else None
+                    session.commit()
+        await asyncio.to_thread(_sync)
 
-                # update tags
-                for tag in tags:
-                    record.tags[tag.key] = tag.value if tag.value else None
-                session.commit()
-
-        # touch data object
-        self.touch_data_object(obj_id)
-
+        await asyncio.to_thread(self.touch_data_object, obj_id)
         return await self.get_meta(obj_id)
 
     async def remove_tags(self, obj_id: str, keys: List[str]) -> DataObject:
         """
         Removes tags from a data object. Authorisation required by the owner of the data object.
         """
-        with self._db_mutex:
-            with self._Session() as session:
-                # do we have an object with this id?
-                record: DataObjectRecord = session.get(DataObjectRecord, obj_id)
-                if record is None:
-                    raise NotFoundError(resource_type='data_object', resource_id=obj_id)
+        def _sync() -> None:
+            with self._db_mutex:
+                with self._Session() as session:
+                    record: DataObjectRecord = session.get(DataObjectRecord, obj_id)
+                    if record is None:
+                        raise NotFoundError(resource_type='data_object', resource_id=obj_id)
+                    for key in keys:
+                        record.tags.pop(key, None)
+                    session.commit()
+        await asyncio.to_thread(_sync)
 
-                # remove keys
-                for key in keys:
-                    record.tags.pop(key, None)
-                session.commit()
-
-        # touch data object
-        self.touch_data_object(obj_id)
-
+        await asyncio.to_thread(self.touch_data_object, obj_id)
         return await self.get_meta(obj_id)
 
     def touch_data_object(self, obj_id) -> None:
+        """Synchronous helper. Callers on the event loop should invoke via
+        asyncio.to_thread to avoid stalling REST accepts under load."""
         with self._db_mutex:
             with self._Session() as session:
                 # do we have an object with this id?
                 record: DataObjectRecord = session.get(DataObjectRecord, obj_id)
                 if record is None:
                     raise NotFoundError(resource_type='data_object', resource_id=obj_id)
-
-                # update the last accessed timestamp of this data object
-                record: DataObjectRecord = session.get(DataObjectRecord, obj_id)
                 record.last_accessed = get_timestamp_now()
                 session.commit()

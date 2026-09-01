@@ -885,3 +885,116 @@ def test_namespace_resource_limits(rti_context: RTIContext):
         trace = ''.join(traceback.format_exception(None, e, e.__traceback__))
         print(trace)
         assert False
+
+
+# ==============================================================================
+# Queue Tests (Flavour A: single jobs queue, batches fail-fast)
+# ==============================================================================
+
+@pytest.mark.integration
+def test_queue_single_jobs_fifo(rti_context: RTIContext):
+    """
+    A namespace budget that fits exactly one job at a time should still accept several
+    submissions: extras stay UNINITIALISED (queued, no container_id) and are drained
+    in submission order as running jobs finish.
+    """
+    owner = rti_context.session_node.keystore
+    mem = rti_context.default_memory
+    proc_id = rti_context.deployed_abc_processor.obj_id
+    rti = rti_context.session_node.rti
+
+    ns = 'queue_fifo'
+    run_coro_safely(rti_context.session_node.db.update_namespace_budget(
+        ns, ResourceDescriptor(vcpus=1, memory=mem)
+    ))
+
+    def submit_slow(name: str, sleep_secs: int) -> Job:
+        # abc processor sleeps 'a' seconds then 'b' seconds before writing c
+        task = (TaskBuilder(proc_id, owner.identity.id)
+                .with_name(name)
+                .with_input_value('a', {'v': sleep_secs})
+                .with_input_value('b', {'v': 0})
+                .with_output('c', owner.identity.id,
+                             target_node_iid=rti_context.session_node.identity.id)
+                .with_budget(memory=mem)
+                .with_namespace(ns)
+                .build())
+        return rti_context.rti_proxy.submit([task], with_authorisation_by=owner)[0]
+
+    job1 = submit_slow('q1', sleep_secs=8)
+    job2 = submit_slow('q2', sleep_secs=1)
+    job3 = submit_slow('q3', sleep_secs=1)
+
+    # give job1 a moment to grab the reservation and job2/job3 to be persisted as queued
+    time.sleep(1.0)
+
+    ns_info = run_coro_safely(rti_context.session_node.db.get_namespace(ns))
+    reserved = set(ns_info.reservations.keys())
+    assert job1.id in reserved, "first job should hold the reservation"
+    assert job2.id not in reserved and job3.id not in reserved, "extras should be queued, not reserved"
+
+    # queued jobs must have no container yet
+    for j in (job2, job3):
+        st = run_coro_safely(rti.get_job_status(j.id))
+        assert st.state == JobStatus.State.UNINITIALISED, f"{j.id} unexpectedly {st.state}"
+
+    # once job1 finishes, job2 should be admitted; then job3
+    wait_for_job_completion(rti_context.rti_proxy, job1.id, owner, timeout=60)
+    wait_for_job_completion(rti_context.rti_proxy, job2.id, owner, timeout=60)
+    wait_for_job_completion(rti_context.rti_proxy, job3.id, owner, timeout=60)
+
+    for j in (job1, job2, job3):
+        st = run_coro_safely(rti.get_job_status(j.id))
+        assert st.state == JobStatus.State.SUCCESSFUL, f"{j.id} ended in {st.state}"
+
+
+@pytest.mark.integration
+def test_queue_batch_rejected_when_budget_short(rti_context: RTIContext):
+    """
+    Batches must launch together, so if a namespace can't admit ALL tasks at submission
+    time, the whole batch must be rejected — no queueing, no partial reservations left.
+    """
+    owner = rti_context.session_node.keystore
+    mem = rti_context.default_memory
+    proc_id = rti_context.deployed_abc_processor.obj_id
+
+    ns = 'queue_batch_reject'
+    # budget fits 2 tasks in isolation, but not concurrently with a single already-holding job
+    run_coro_safely(rti_context.session_node.db.update_namespace_budget(
+        ns, ResourceDescriptor(vcpus=2, memory=mem * 2)
+    ))
+
+    # occupy the namespace with a long-running single job holding half the budget
+    hog = (TaskBuilder(proc_id, owner.identity.id)
+           .with_name('hog')
+           .with_input_value('a', {'v': 10}).with_input_value('b', {'v': 0})
+           .with_output('c', owner.identity.id,
+                        target_node_iid=rti_context.session_node.identity.id)
+           .with_budget(memory=mem).with_namespace(ns).build())
+    hog_job = rti_context.rti_proxy.submit([hog], with_authorisation_by=owner)[0]
+    time.sleep(1.0)
+
+    # now try a batch of 2 (each memory=mem, so combined mem*2 fits the static budget
+    # but not the current available space since hog holds mem)
+    def batch_task(name: str) -> Task:
+        return (TaskBuilder(proc_id, owner.identity.id)
+                .with_name(name)
+                .with_input_value('a', {'v': 1}).with_input_value('b', {'v': 0})
+                .with_output('c', owner.identity.id,
+                             target_node_iid=rti_context.session_node.identity.id)
+                .with_budget(memory=mem).with_namespace(ns).build())
+
+    with pytest.raises(RemoteError) as ei:
+        rti_context.rti_proxy.submit([batch_task('b1'), batch_task('b2')],
+                                     with_authorisation_by=owner)
+    reason = (ei.value.reason or '').lower()
+    details = str(ei.value.details or '').lower()
+    assert 'batch' in reason or 'batch' in details or 'admit' in reason or 'admit' in details
+
+    # after rejection, no partial reservation should linger from the batch
+    ns_info = run_coro_safely(rti_context.session_node.db.get_namespace(ns))
+    assert set(ns_info.reservations.keys()) == {hog_job.id}, \
+        f"unexpected reservations after batch rejection: {ns_info.reservations}"
+
+    # let the hog finish so the fixture cleans up cleanly
+    wait_for_job_completion(rti_context.rti_proxy, hog_job.id, owner, timeout=60)

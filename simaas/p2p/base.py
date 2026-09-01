@@ -1,4 +1,5 @@
 import abc
+import asyncio
 import json
 import os
 import random
@@ -62,9 +63,14 @@ async def p2p_request(
         attachment_path: Optional[str] = None, download_path: Optional[str] = None,
         timeout: Optional[int] = None, chunk_size: int = 1024 * 1024
 ) -> Tuple[Optional[BaseModel], Optional[str]]:
-    # compute size-aware timeout for large attachments
+    # compute size-aware timeout for large attachments.
+    # Default is 30s (not 5s): even with concurrent server-side handlers, a
+    # ROUTER socket that's fair-queuing dozens of requesters and running each
+    # handler through DB writes can occasionally exceed 5s for a single reply.
+    # 30s is generous for a "small payload should be instant" fallback but not
+    # so long that a genuinely wedged peer hangs the client indefinitely.
     attachment_size = os.path.getsize(attachment_path) if attachment_path else 0
-    base_timeout = timeout if timeout is not None else 5000
+    base_timeout = timeout if timeout is not None else 30000
     effective_timeout = max(base_timeout, int(attachment_size / _THROUGHPUT_FLOOR * 1000))
 
     # create socket
@@ -183,8 +189,24 @@ async def p2p_request(
         socket.close()
         raise NetworkError(peer_address=peer.address, operation='receive', trace=trace)
 
+async def _send_multipart(socket: Socket, frames: list, send_lock: Optional[asyncio.Lock]) -> None:
+    """Wrapper around socket.send_multipart that optionally serialises writes.
+
+    When the server dispatches handlers concurrently, multiple coroutines share
+    the same ROUTER socket. zmq.asyncio sockets are not safe for concurrent
+    sends: the frames of one reply can interleave with another. A send lock
+    passed in from the server serialises the multi-frame send atomically.
+    """
+    if send_lock is None:
+        await socket.send_multipart(frames)
+    else:
+        async with send_lock:
+            await socket.send_multipart(frames)
+
+
 async def p2p_send_error(
-        socket: Socket, cid: bytes, rid: bytes, protocol_name: str, reason: str, **extra
+        socket: Socket, cid: bytes, rid: bytes, protocol_name: str, reason: str,
+        send_lock: Optional[asyncio.Lock] = None, **extra,
 ) -> None:
     """Send a protocol-level error reply (used e.g. when the requested protocol is not registered).
 
@@ -197,14 +219,15 @@ async def p2p_send_error(
             content={'reason': reason, **extra},
             attachment_size=0,
         )
-        await socket.send_multipart([cid, rid, json.dumps(reply.model_dump()).encode('utf-8')])
+        await _send_multipart(socket, [cid, rid, json.dumps(reply.model_dump()).encode('utf-8')], send_lock)
     except Exception as e:
         log.warning('respond', 'Failed to send P2P error reply', exc=e, protocol=protocol_name)
 
 
 async def p2p_respond(
         socket: Socket, cid: bytes, rid: bytes, protocol: P2PProtocol, request: P2PMessage,
-        attachment_path: Optional[str] = None, download_path: Optional[str] = None, chunk_size: int = 1024 * 1024
+        attachment_path: Optional[str] = None, download_path: Optional[str] = None,
+        chunk_size: int = 1024 * 1024, send_lock: Optional[asyncio.Lock] = None,
 ) -> None:
     try:
         # Handle the request - let application errors propagate with clear tracebacks
@@ -228,19 +251,33 @@ async def p2p_respond(
             reply: dict = reply.model_dump()
             reply: str = json.dumps(reply)
             reply: bytes = reply.encode('utf-8')
-            await socket.send_multipart([cid, rid, reply])
 
-            # if we have a reply attachment, send it in chunks
-            if reply_attachment_path is not None:
-                with open(reply_attachment_path, 'rb') as f:
-                    total_sent = 0
-                    while total_sent < reply_attachment_size:
-                        chunk = f.read(chunk_size)
-                        if not chunk:
-                            break
-
-                        await socket.send_multipart([cid, rid, chunk])
-                        total_sent += len(chunk)
+            # Under a send_lock, the reply header and all attachment chunks must
+            # be sent as one atomic block so a concurrent handler's frames can't
+            # interleave with ours mid-stream.
+            if send_lock is not None:
+                async with send_lock:
+                    await socket.send_multipart([cid, rid, reply])
+                    if reply_attachment_path is not None:
+                        with open(reply_attachment_path, 'rb') as f:
+                            total_sent = 0
+                            while total_sent < reply_attachment_size:
+                                chunk = f.read(chunk_size)
+                                if not chunk:
+                                    break
+                                await socket.send_multipart([cid, rid, chunk])
+                                total_sent += len(chunk)
+            else:
+                await socket.send_multipart([cid, rid, reply])
+                if reply_attachment_path is not None:
+                    with open(reply_attachment_path, 'rb') as f:
+                        total_sent = 0
+                        while total_sent < reply_attachment_size:
+                            chunk = f.read(chunk_size)
+                            if not chunk:
+                                break
+                            await socket.send_multipart([cid, rid, chunk])
+                            total_sent += len(chunk)
 
         except Exception as e:
             trace = ''.join(traceback.format_exception(None, e, e.__traceback__))

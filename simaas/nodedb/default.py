@@ -1,3 +1,4 @@
+import asyncio
 import threading
 from typing import Optional, List, Tuple
 
@@ -5,6 +6,17 @@ from sqlalchemy import Column, String, BigInteger, Integer, Boolean, JSON
 from sqlalchemy import create_engine
 from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import sessionmaker, declarative_base
+
+
+def _sqlite_connect_args(db_path: str) -> dict:
+    """SQLite connections default to rejecting use from a thread other than the
+    one that created them. We now dispatch DB work via asyncio.to_thread so
+    connections are pulled from the pool on worker threads; disable the check
+    so any pooled connection can serve any worker thread. Safe because a
+    SQLAlchemy Session serialises access within itself."""
+    if db_path.startswith("sqlite"):
+        return {"check_same_thread": False}
+    return {}
 
 from simaas.core.helpers import get_timestamp_now
 from simaas.core.identity import Identity
@@ -67,7 +79,7 @@ class DefaultNodeDBService(NodeDBService):
         self._mutex = threading.Lock()
 
         # initialise database things
-        self._engine = create_engine(db_path)
+        self._engine = create_engine(db_path, connect_args=_sqlite_connect_args(db_path))
         Base.metadata.create_all(self._engine)
         self._Session = sessionmaker(bind=self._engine)
 
@@ -75,28 +87,11 @@ class DefaultNodeDBService(NodeDBService):
         """
         Retrieves information about the node.
         """
-        with self._Session() as session:
-            record = session.get(NodeRecord, self._node.identity.id)
-            return NodeInfo(
-                identity=self._node.identity,
-                last_seen=record.last_seen,
-                dor_service=record.dor_service,
-                rti_service=record.rti_service,
-                p2p_address=record.p2p_address,
-                rest_address=_parse_rest_address(record.rest_address) if record.rest_address else None,
-                retain_job_history=record.retain_job_history if record.retain_job_history is not None else None,
-                strict_deployment=record.strict_deployment if record.strict_deployment is not None else None
-            )
-
-    async def get_network(self) -> List[NodeInfo]:
-        """
-        Retrieves information about all peers known to the node.
-        """
-        with self._Session() as session:
-            result = []
-            for record in session.query(NodeRecord).all():
-                result.append(NodeInfo(
-                    identity=await self.get_identity(record.iid, raise_if_unknown=True),
+        def _sync() -> NodeInfo:
+            with self._Session() as session:
+                record = session.get(NodeRecord, self._node.identity.id)
+                return NodeInfo(
+                    identity=self._node.identity,
                     last_seen=record.last_seen,
                     dor_service=record.dor_service,
                     rti_service=record.rti_service,
@@ -104,114 +99,144 @@ class DefaultNodeDBService(NodeDBService):
                     rest_address=_parse_rest_address(record.rest_address) if record.rest_address else None,
                     retain_job_history=record.retain_job_history if record.retain_job_history is not None else None,
                     strict_deployment=record.strict_deployment if record.strict_deployment is not None else None
-                ))
+                )
+        return await asyncio.to_thread(_sync)
+
+    async def get_network(self) -> List[NodeInfo]:
+        """
+        Retrieves information about all peers known to the node.
+
+        Original implementation invoked ``self.get_identity`` (a coroutine) inside
+        the synchronous session block, which forced this method to remain
+        async-inline. Refactored: fetch node rows and their identity rows in a
+        single worker-thread pass so the whole thing can offload cleanly.
+        """
+        def _sync() -> List[NodeInfo]:
+            result: List[NodeInfo] = []
+            with self._Session() as session:
+                for record in session.query(NodeRecord).all():
+                    identity_record = session.query(IdentityRecord).filter_by(iid=record.iid).first()
+                    if identity_record is None:
+                        raise NotFoundError(resource_type='identity', resource_id=record.iid)
+                    identity = Identity(
+                        id=identity_record.iid,
+                        name=identity_record.name,
+                        email=identity_record.email,
+                        s_public_key=identity_record.s_public_key,
+                        e_public_key=identity_record.e_public_key,
+                        c_public_key=identity_record.c_public_key,
+                        nonce=identity_record.nonce,
+                        signature=identity_record.signature,
+                        last_seen=identity_record.last_seen,
+                    )
+                    result.append(NodeInfo(
+                        identity=identity,
+                        last_seen=record.last_seen,
+                        dor_service=record.dor_service,
+                        rti_service=record.rti_service,
+                        p2p_address=record.p2p_address,
+                        rest_address=_parse_rest_address(record.rest_address) if record.rest_address else None,
+                        retain_job_history=record.retain_job_history if record.retain_job_history is not None else None,
+                        strict_deployment=record.strict_deployment if record.strict_deployment is not None else None
+                    ))
             return result
+        return await asyncio.to_thread(_sync)
 
     async def update_network(self, node: NodeInfo) -> None:
         """
         Adds information about a node to the db. If there is already information about this node in the database, the
         db is updated accordingly.
         """
-        with self._Session() as session:
-            # find all conflicting records, i.e., records of a node with a different iid but on the same P2P/REST
-            # address but different (if any).
-            p2p_address = node.p2p_address
-            rest_address = f"{node.rest_address[0]}:{node.rest_address[1]}" if node.rest_address else None
+        def _sync() -> None:
+            with self._Session() as session:
+                # find all conflicting records, i.e., records of a node with a different iid but on the same P2P/REST
+                # address but different (if any).
+                p2p_address = node.p2p_address
+                rest_address = f"{node.rest_address[0]}:{node.rest_address[1]}" if node.rest_address else None
 
-            conflicting_records = session.query(NodeRecord).filter(
-                (NodeRecord.iid != node.identity.id) & (
-                    (NodeRecord.p2p_address == p2p_address) |
-                    (NodeRecord.rest_address == rest_address if rest_address else False)
-                )
-            ).all()
+                conflicting_records = session.query(NodeRecord).filter(
+                    (NodeRecord.iid != node.identity.id) & (
+                        (NodeRecord.p2p_address == p2p_address) |
+                        (NodeRecord.rest_address == rest_address if rest_address else False)
+                    )
+                ).all()
 
-            for record in conflicting_records:
-                if record.last_seen >= node.last_seen:
-                    log.debug("Ignoring network node update, conflicting address but more recent timestamp found", record_iid=record.iid, node_iid=node.identity.id)
-                else:
-                    log.debug("Deleting record with outdated and conflicting address", record_iid=record.iid, node_iid=node.identity.id)
+                for record in conflicting_records:
+                    if record.last_seen >= node.last_seen:
+                        log.debug("Ignoring network node update, conflicting address but more recent timestamp found", record_iid=record.iid, node_iid=node.identity.id)
+                    else:
+                        log.debug("Deleting record with outdated and conflicting address", record_iid=record.iid, node_iid=node.identity.id)
 
-                    session.query(NodeRecord).filter_by(iid=record.iid).delete()
+                        session.query(NodeRecord).filter_by(iid=record.iid).delete()
+                        session.commit()
+
+                # do we already have a record for this node? only update if either the record does not exist yet OR if
+                # the information provided is more recent.
+                record = session.query(NodeRecord).filter_by(iid=node.identity.id).first()
+                if record is None:
+                    session.add(NodeRecord(iid=node.identity.id, last_seen=node.last_seen,
+                                           dor_service=node.dor_service, rti_service=node.rti_service,
+                                           p2p_address=p2p_address, rest_address=rest_address,
+                                           retain_job_history=node.retain_job_history,
+                                           strict_deployment=node.strict_deployment))
                     session.commit()
 
-            # do we already have a record for this node? only update if either the record does not exist yet OR if
-            # the information provided is more recent.
-            record = session.query(NodeRecord).filter_by(iid=node.identity.id).first()
-            if record is None:
-                session.add(NodeRecord(iid=node.identity.id, last_seen=node.last_seen,
-                                       dor_service=node.dor_service, rti_service=node.rti_service,
-                                       p2p_address=p2p_address, rest_address=rest_address,
-                                       retain_job_history=node.retain_job_history,
-                                       strict_deployment=node.strict_deployment))
-                session.commit()
+                elif node.last_seen > record.last_seen:
+                    record.last_seen = node.last_seen
+                    record.dor_service = node.dor_service
+                    record.rti_service = node.rti_service
+                    record.p2p_address = p2p_address
+                    record.rest_address = rest_address
+                    record.retain_job_history = node.retain_job_history
+                    record.strict_deployment = node.strict_deployment
+                    session.commit()
 
-            elif node.last_seen > record.last_seen:
-                record.last_seen = node.last_seen
-                record.dor_service = node.dor_service
-                record.rti_service = node.rti_service
-                record.p2p_address = p2p_address
-                record.rest_address = rest_address
-                record.retain_job_history = node.retain_job_history
-                record.strict_deployment = node.strict_deployment
-                session.commit()
-
-            else:
-                log.debug("Ignoring network node update, more recent record found", record_iid=record.iid, node_iid=node.identity.id)
+                else:
+                    log.debug("Ignoring network node update, more recent record found", record_iid=record.iid, node_iid=node.identity.id)
+        await asyncio.to_thread(_sync)
 
     async def remove_node_by_id(self, identity: Identity) -> None:
         """
         Removes a node from the db, given its identity.
         """
-        with self._Session() as session:
-            session.query(NodeRecord).filter_by(iid=identity.id).delete()
-            session.commit()
+        def _sync() -> None:
+            with self._Session() as session:
+                session.query(NodeRecord).filter_by(iid=identity.id).delete()
+                session.commit()
+        await asyncio.to_thread(_sync)
 
     async def remove_node_by_address(self, address: (str, int)) -> None:
         """
         Removes a node from the db, given its address (host, port).
         """
-        with self._Session() as session:
-            session.query(NodeRecord).filter_by(p2p_address=f"{address[0]}:{address[1]}").delete()
-            session.commit()
+        def _sync() -> None:
+            with self._Session() as session:
+                session.query(NodeRecord).filter_by(p2p_address=f"{address[0]}:{address[1]}").delete()
+                session.commit()
+        await asyncio.to_thread(_sync)
 
     async def reset_network(self) -> None:
         """
         Resets the db, i.e., removes the information of all nodes in the db.
         """
-        with self._Session() as session:
-            session.query(NodeRecord).filter(NodeRecord.iid != self._node.identity.id).delete()
-            session.commit()
+        def _sync() -> None:
+            with self._Session() as session:
+                session.query(NodeRecord).filter(NodeRecord.iid != self._node.identity.id).delete()
+                session.commit()
+        await asyncio.to_thread(_sync)
 
     async def get_identity(self, iid: str, raise_if_unknown: bool = False) -> Optional[Identity]:
         """
         Retrieves the identity given its id (if the node db knows about it).
         """
-        with self._Session() as session:
-            record = session.query(IdentityRecord).filter_by(iid=iid).first()
+        def _sync() -> Optional[Identity]:
+            with self._Session() as session:
+                record = session.query(IdentityRecord).filter_by(iid=iid).first()
 
-            if raise_if_unknown and record is None:
-                raise NotFoundError(resource_type='identity', resource_id=iid)
+                if raise_if_unknown and record is None:
+                    raise NotFoundError(resource_type='identity', resource_id=iid)
 
-            return Identity(
-                id=record.iid,
-                name=record.name,
-                email=record.email,
-                s_public_key=record.s_public_key,
-                e_public_key=record.e_public_key,
-                c_public_key=record.c_public_key,
-                nonce=record.nonce,
-                signature=record.signature,
-                last_seen=record.last_seen
-            ) if record else None
-
-    async def get_identities(self) -> List[Identity]:
-        """
-        Retrieves a list of all identities known to the node.
-        """
-        with self._Session() as session:
-            records = session.query(IdentityRecord).all()
-            return [
-                Identity(
+                return Identity(
                     id=record.iid,
                     name=record.name,
                     email=record.email,
@@ -221,8 +246,30 @@ class DefaultNodeDBService(NodeDBService):
                     nonce=record.nonce,
                     signature=record.signature,
                     last_seen=record.last_seen
-                ) for record in records
-            ]
+                ) if record else None
+        return await asyncio.to_thread(_sync)
+
+    async def get_identities(self) -> List[Identity]:
+        """
+        Retrieves a list of all identities known to the node.
+        """
+        def _sync() -> List[Identity]:
+            with self._Session() as session:
+                records = session.query(IdentityRecord).all()
+                return [
+                    Identity(
+                        id=record.iid,
+                        name=record.name,
+                        email=record.email,
+                        s_public_key=record.s_public_key,
+                        e_public_key=record.e_public_key,
+                        c_public_key=record.c_public_key,
+                        nonce=record.nonce,
+                        signature=record.signature,
+                        last_seen=record.last_seen
+                    ) for record in records
+                ]
+        return await asyncio.to_thread(_sync)
 
     async def update_identity(self, identity: Identity) -> Identity:
         """
@@ -232,42 +279,53 @@ class DefaultNodeDBService(NodeDBService):
         if not identity.verify_integrity():
             raise ValidationError(field='identity', expected='valid signature', actual='invalid signature')
 
-        # update the db
-        with self._Session() as session:
-            # do we have the identity already on record?
-            record = session.query(IdentityRecord).filter_by(iid=identity.id).first()
-            if record is None:
-                session.add(IdentityRecord(iid=identity.id, name=identity.name, email=identity.email,
-                                           s_public_key=identity.s_public_key, e_public_key=identity.e_public_key,
-                                           c_public_key=identity.c_public_key, nonce=identity.nonce,
-                                           signature=identity.signature, last_seen=get_timestamp_now()))
-                session.commit()
+        def _sync_upsert_and_fetch() -> Identity:
+            with self._Session() as session:
+                record = session.query(IdentityRecord).filter_by(iid=identity.id).first()
+                if record is None:
+                    session.add(IdentityRecord(iid=identity.id, name=identity.name, email=identity.email,
+                                               s_public_key=identity.s_public_key, e_public_key=identity.e_public_key,
+                                               c_public_key=identity.c_public_key, nonce=identity.nonce,
+                                               signature=identity.signature, last_seen=get_timestamp_now()))
+                    session.commit()
 
-            # only perform update if either the record does not exist yet OR if the information provided is valid
-            # and more recent, i.e., if the nonce is greater than the one on record.
-            elif identity.nonce > record.nonce:
-                record.name = identity.name
-                record.email = identity.email
-                record.nonce = identity.nonce
-                record.s_public_key = identity.s_public_key
-                record.e_public_key = identity.e_public_key
-                record.c_public_key = identity.c_public_key
-                record.signature = identity.signature
-                record.last_seen = get_timestamp_now()
-                session.commit()
+                # only perform update if either the record does not exist yet OR if the information provided is valid
+                # and more recent, i.e., if the nonce is greater than the one on record.
+                elif identity.nonce > record.nonce:
+                    record.name = identity.name
+                    record.email = identity.email
+                    record.nonce = identity.nonce
+                    record.s_public_key = identity.s_public_key
+                    record.e_public_key = identity.e_public_key
+                    record.c_public_key = identity.c_public_key
+                    record.signature = identity.signature
+                    record.last_seen = get_timestamp_now()
+                    session.commit()
 
-            else:
-                log.debug("Ignoring identity update, nonce on record is more recent")
+                else:
+                    log.debug("Ignoring identity update, nonce on record is more recent")
 
-        return await self.get_identity(identity.id, raise_if_unknown=True)
+                # read-back in the same session so we don't need a second round-trip
+                fresh = session.query(IdentityRecord).filter_by(iid=identity.id).first()
+                if fresh is None:
+                    raise NotFoundError(resource_type='identity', resource_id=identity.id)
+                return Identity(
+                    id=fresh.iid, name=fresh.name, email=fresh.email,
+                    s_public_key=fresh.s_public_key, e_public_key=fresh.e_public_key,
+                    c_public_key=fresh.c_public_key, nonce=fresh.nonce,
+                    signature=fresh.signature, last_seen=fresh.last_seen,
+                )
+        return await asyncio.to_thread(_sync_upsert_and_fetch)
 
     async def delete_identity(self, iid: str) -> None:
         """
         Deletes an identity from the database if it exists.
         """
-        with self._Session() as session:
-            session.query(IdentityRecord).filter_by(iid=iid).delete()
-            session.commit()
+        def _sync() -> None:
+            with self._Session() as session:
+                session.query(IdentityRecord).filter_by(iid=iid).delete()
+                session.commit()
+        await asyncio.to_thread(_sync)
 
     async def get_snapshot(self, exclude: List[str] = None) -> NodeDBSnapshot:
         """
@@ -291,42 +349,46 @@ class DefaultNodeDBService(NodeDBService):
         return NodeDBSnapshot(update_identity=identities, update_network=nodes, update_namespace=namespaces)
 
     async def touch_identity(self, identity: Identity) -> None:
-        with self._Session() as session:
-            # do we have the identity already on record?
-            record = session.get(IdentityRecord, identity.id)
-            if record is None:
-                raise NotFoundError(resource_type='identity', resource_id=identity.id)
-
-            record.last_accessed = get_timestamp_now()
-            session.commit()
+        def _sync() -> None:
+            with self._Session() as session:
+                record = session.get(IdentityRecord, identity.id)
+                if record is None:
+                    raise NotFoundError(resource_type='identity', resource_id=identity.id)
+                record.last_accessed = get_timestamp_now()
+                session.commit()
+        await asyncio.to_thread(_sync)
 
     async def get_namespace(self, name: str) -> Optional[NamespaceInfo]:
         """
         Returns information about a namespace (if it exists).
         """
-        with self._Session() as session:
-            record = session.get(NamespaceRecord,name)
-            return NamespaceInfo(
-                name=record.name,
-                budget=ResourceDescriptor.model_validate(record.budget),
-                reservations={k: ResourceDescriptor.model_validate(v) for k, v in record.reservations.items()},
-                jobs=[job_id for job_id in record.jobs]
-            ) if record else None
+        def _sync() -> Optional[NamespaceInfo]:
+            with self._Session() as session:
+                record = session.get(NamespaceRecord, name)
+                return NamespaceInfo(
+                    name=record.name,
+                    budget=ResourceDescriptor.model_validate(record.budget),
+                    reservations={k: ResourceDescriptor.model_validate(v) for k, v in record.reservations.items()},
+                    jobs=[job_id for job_id in record.jobs]
+                ) if record else None
+        return await asyncio.to_thread(_sync)
 
     async def get_namespaces(self) -> List[NamespaceInfo]:
         """
         Returns a list of all namespaces.
         """
-        with self._Session() as session:
-            records = session.query(NamespaceRecord).all()
-            return [
-                NamespaceInfo(
-                    name=record.name,
-                    budget=ResourceDescriptor.model_validate(record.budget),
-                    reservations={k: ResourceDescriptor.model_validate(v) for k, v in record.reservations.items()},
-                    jobs=[job_id for job_id in record.jobs]
-                ) for record in records
-            ]
+        def _sync() -> List[NamespaceInfo]:
+            with self._Session() as session:
+                records = session.query(NamespaceRecord).all()
+                return [
+                    NamespaceInfo(
+                        name=record.name,
+                        budget=ResourceDescriptor.model_validate(record.budget),
+                        reservations={k: ResourceDescriptor.model_validate(v) for k, v in record.reservations.items()},
+                        jobs=[job_id for job_id in record.jobs]
+                    ) for record in records
+                ]
+        return await asyncio.to_thread(_sync)
 
     async def update_namespace_budget(self, name: str, budget: ResourceDescriptor) -> NamespaceInfo:
         """
@@ -339,7 +401,8 @@ class DefaultNodeDBService(NodeDBService):
 
         return ns_info
 
-    async def reserve_namespace_resources(self, name: str, job_id: str, resources: ResourceDescriptor) -> None:
+    async def reserve_namespace_resources(self, name: str, job_id: str, resources: ResourceDescriptor,
+                                          raise_on_fail: bool = True) -> bool:
         # try to make a resource reservation
         successful = True
         for peer in await self._node.db.get_network():
@@ -362,7 +425,11 @@ class DefaultNodeDBService(NodeDBService):
                 else:
                     await P2PCancelNamespaceReservation.perform(self._node, peer, name, job_id)
 
-            raise OperationError(operation='reserve_namespace', stage='reservation', cause=f'{name}:{job_id} failed')
+            if raise_on_fail:
+                raise OperationError(operation='reserve_namespace', stage='reservation', cause=f'{name}:{job_id} failed')
+            return False
+
+        return True
 
     async def cancel_namespace_reservation(self, name: str, job_id: str) -> bool:
         result = await self.handle_namespace_cancellation(name, job_id)
@@ -372,90 +439,89 @@ class DefaultNodeDBService(NodeDBService):
         return result
 
     async def handle_namespace_snapshot(self, ns_info: NamespaceInfo) -> None:
-        with self._mutex:
-            with self._Session() as session:
-                record = session.get(NamespaceRecord,ns_info.name)
-                if record is None:
-                    record = NamespaceRecord(
-                        name=ns_info.name,
-                        budget=ns_info.budget.model_dump(),
-                        reservations={k: v.model_dump() for k, v in ns_info.reservations.items()},
-                        jobs=[job_id for job_id in ns_info.jobs]
-                    )
-                    session.add(record)
-                    session.commit()
-                else:
-                    record.budget = ns_info.budget.model_dump()
-                    record.reservations = {k: v.model_dump() for k, v in ns_info.reservations.items()}
-                    record.jobs = [job_id for job_id in ns_info.jobs]
-                    session.commit()
+        def _sync() -> None:
+            with self._mutex:
+                with self._Session() as session:
+                    record = session.get(NamespaceRecord, ns_info.name)
+                    if record is None:
+                        record = NamespaceRecord(
+                            name=ns_info.name,
+                            budget=ns_info.budget.model_dump(),
+                            reservations={k: v.model_dump() for k, v in ns_info.reservations.items()},
+                            jobs=[job_id for job_id in ns_info.jobs]
+                        )
+                        session.add(record)
+                        session.commit()
+                    else:
+                        record.budget = ns_info.budget.model_dump()
+                        record.reservations = {k: v.model_dump() for k, v in ns_info.reservations.items()}
+                        record.jobs = [job_id for job_id in ns_info.jobs]
+                        session.commit()
+        await asyncio.to_thread(_sync)
 
     async def handle_namespace_update(self, name: str, budget: ResourceDescriptor) -> NamespaceInfo:
-        with self._mutex:
-            with self._Session() as session:
-                record = session.get(NamespaceRecord,name)
-                if record is None:
-                    record = NamespaceRecord(
-                        name=name,
-                        budget=budget.model_dump(),
-                        reservations={},
-                        jobs=[]
-                    )
-                    session.add(record)
-                    session.commit()
-                else:
-                    record.budget=budget.model_dump()
-                    session.commit()
+        def _sync() -> NamespaceInfo:
+            with self._mutex:
+                with self._Session() as session:
+                    record = session.get(NamespaceRecord, name)
+                    if record is None:
+                        record = NamespaceRecord(
+                            name=name,
+                            budget=budget.model_dump(),
+                            reservations={},
+                            jobs=[]
+                        )
+                        session.add(record)
+                        session.commit()
+                    else:
+                        record.budget = budget.model_dump()
+                        session.commit()
 
-                return NamespaceInfo(
-                    name=record.name,
-                    budget=ResourceDescriptor.model_validate(record.budget),
-                    reservations={k: ResourceDescriptor.model_validate(v) for k, v in record.reservations.items()},
-                    jobs=[job_id for job_id in record.jobs]
-                )
+                    return NamespaceInfo(
+                        name=record.name,
+                        budget=ResourceDescriptor.model_validate(record.budget),
+                        reservations={k: ResourceDescriptor.model_validate(v) for k, v in record.reservations.items()},
+                        jobs=[job_id for job_id in record.jobs]
+                    )
+        return await asyncio.to_thread(_sync)
 
     async def handle_namespace_reservation(self, name: str, job_id: str, request: ResourceDescriptor) -> bool:
-        with self._mutex:
-            with self._Session() as session:
-                # does the namespace exist?
-                record: Optional[NamespaceRecord] = session.get(NamespaceRecord,name)
-                if record is None:
-                    raise NotFoundError(resource_type='namespace', resource_id=name)
+        def _sync() -> bool:
+            with self._mutex:
+                with self._Session() as session:
+                    record: Optional[NamespaceRecord] = session.get(NamespaceRecord, name)
+                    if record is None:
+                        raise NotFoundError(resource_type='namespace', resource_id=name)
 
-                # determine the total available budget for this namespace
-                budget: ResourceDescriptor = ResourceDescriptor.model_validate(record.budget)
-                vcpus_available = budget.vcpus
-                memory_available = budget.memory
+                    budget: ResourceDescriptor = ResourceDescriptor.model_validate(record.budget)
+                    vcpus_available = budget.vcpus
+                    memory_available = budget.memory
 
-                # consider all reservations
-                for reservation in record.reservations.values():
-                    reservation: ResourceDescriptor = ResourceDescriptor.model_validate(reservation)
-                    vcpus_available -= reservation.vcpus
-                    memory_available -= reservation.memory
+                    for reservation in record.reservations.values():
+                        reservation = ResourceDescriptor.model_validate(reservation)
+                        vcpus_available -= reservation.vcpus
+                        memory_available -= reservation.memory
 
-                # does the namespace has enough resources left?
-                sufficient_vcpus = request.vcpus <= vcpus_available
-                sufficient_memory = request.memory <= memory_available
-                if sufficient_vcpus and sufficient_memory:
-                    # add the reservation
-                    record.reservations[job_id] = request.model_dump()
-                    session.commit()
-                    return True
-
-                else:
-                    return False
-
-    async def handle_namespace_cancellation(self, name: str, job_id: str) -> bool:
-        with self._mutex:
-            with self._Session() as session:
-                # does the namespace exist?
-                record: Optional[NamespaceRecord] = session.get(NamespaceRecord,name)
-                if record is not None:
-                    # do we have this reservation?
-                    reservations = dict(record.reservations)
-                    if job_id in reservations:
-                        reservations.pop(job_id)
-                        record.reservations = reservations
+                    sufficient_vcpus = request.vcpus <= vcpus_available
+                    sufficient_memory = request.memory <= memory_available
+                    if sufficient_vcpus and sufficient_memory:
+                        record.reservations[job_id] = request.model_dump()
                         session.commit()
                         return True
-        return False
+                    return False
+        return await asyncio.to_thread(_sync)
+
+    async def handle_namespace_cancellation(self, name: str, job_id: str) -> bool:
+        def _sync() -> bool:
+            with self._mutex:
+                with self._Session() as session:
+                    record: Optional[NamespaceRecord] = session.get(NamespaceRecord, name)
+                    if record is not None:
+                        reservations = dict(record.reservations)
+                        if job_id in reservations:
+                            reservations.pop(job_id)
+                            record.reservations = reservations
+                            session.commit()
+                            return True
+            return False
+        return await asyncio.to_thread(_sync)
