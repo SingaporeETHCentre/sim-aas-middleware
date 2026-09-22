@@ -15,13 +15,21 @@ from zmq.asyncio import Socket, Context
 from simaas.core.errors import ConfigurationError, OperationError
 from simaas.core.keystore import Keystore
 from simaas.core.logging import get_logger
-from simaas.p2p.base import P2PProtocol, P2PMessage, p2p_respond
+from simaas.p2p.base import P2PProtocol, P2PMessage, p2p_respond, p2p_send_error
 
 log = get_logger('simaas.p2p', 'p2p')
 
 
+# Cap on concurrent in-flight P2P handlers per server. Beyond this, incoming
+# frames still queue at the socket but reads never block on handler execution,
+# so the socket drain rate stays high. 64 is generous for our workloads
+# (14-way container spawns) while bounded enough to prevent runaway growth.
+_DEFAULT_HANDLER_CONCURRENCY = 64
+
+
 class P2PService:
-    def __init__(self, keystore: Keystore, address: str) -> None:
+    def __init__(self, keystore: Keystore, address: str,
+                 handler_concurrency: int = _DEFAULT_HANDLER_CONCURRENCY) -> None:
         self._mutex = Lock()
         self._keystore = keystore
         self._address = address
@@ -33,6 +41,12 @@ class P2PService:
         self._stopped_event = threading.Event()  # Signals handler has fully stopped
         self._pending: Dict[P2PProtocol, bytes, Tuple[P2PMessage, str]] = {}
         self._thread: Optional[threading.Thread] = None
+        # Concurrency control created lazily in the event loop that owns the
+        # socket. Dispatch tasks are tracked so shutdown can await them.
+        self._handler_concurrency = handler_concurrency
+        self._send_lock: Optional[asyncio.Lock] = None
+        self._handler_sem: Optional[asyncio.Semaphore] = None
+        self._inflight: set = set()
 
     def is_ready(self) -> bool:
         return self._socket is not None
@@ -168,8 +182,36 @@ class P2PService:
             await asyncio.sleep(0.1)
         return True
 
+    async def _dispatch_respond(self, cid: bytes, rid: bytes, protocol: P2PProtocol,
+                                request: P2PMessage, attachment_path: Optional[str],
+                                download_path: str) -> None:
+        """Bounded, isolated handler task. Runs a single p2p_respond under the
+        concurrency semaphore. Exceptions are logged so a bad handler can't
+        take down the read loop or leak a semaphore permit."""
+        async with self._handler_sem:
+            try:
+                await p2p_respond(
+                    self._socket, cid, rid, protocol, request,
+                    attachment_path=attachment_path, download_path=download_path,
+                    send_lock=self._send_lock,
+                )
+            except Exception as e:
+                log.warning('server', 'Handler task raised', exc=e, protocol=protocol.name())
+
+    def _spawn(self, coro) -> None:
+        """Schedule coro as an independent task; track it so shutdown can await."""
+        task = asyncio.create_task(coro)
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
+
     async def _handle_incoming_connections(self):
         log.info('server', 'Listening for P2P connections')
+        # Concurrency primitives are created here because they must live on the
+        # event loop that owns the socket (which may be a background thread's
+        # loop set up in _run_event_loop).
+        self._send_lock = asyncio.Lock()
+        self._handler_sem = asyncio.Semaphore(self._handler_concurrency)
+
         try:
             with tempfile.TemporaryDirectory() as tempdir:
                 while not self._stop_event.is_set():
@@ -189,7 +231,14 @@ class P2PService:
                             # do we know the protocol?
                             protocol = self._protocols.get(request.protocol)
                             if protocol is None:
-                                log.warning('server', 'Unsupported protocol, ignoring', protocol=request.protocol)
+                                log.warning('server', 'Unsupported protocol, replying with error', protocol=request.protocol)
+                                # Fire-and-forget the error reply so we don't
+                                # block the read loop on send.
+                                self._spawn(p2p_send_error(
+                                    self._socket, cid, rid, request.protocol,
+                                    f"protocol '{request.protocol}' is not supported by this peer",
+                                    send_lock=self._send_lock,
+                                ))
                                 continue
 
                             # does this request come with an attachment?
@@ -197,11 +246,15 @@ class P2PService:
                                 attachment_path: str = os.path.join(tempdir, rid.decode('utf-8'))
                                 self._pending[rid] = (protocol, request, attachment_path)
 
-                            # if there is no attachment, process the message straight away
+                            # if there is no attachment, dispatch handling
+                            # concurrently — the read loop moves on immediately
+                            # so bursts of requests don't back up behind a slow
+                            # handler.
                             else:
-                                await p2p_respond(
-                                    self._socket, cid, rid, protocol, request, download_path=tempdir
-                                )
+                                self._spawn(self._dispatch_respond(
+                                    cid, rid, protocol, request,
+                                    attachment_path=None, download_path=tempdir,
+                                ))
 
                         # if it's pending, then we need to keep receiving the contents until the attachment has been
                         # fully received.
@@ -216,9 +269,10 @@ class P2PService:
                             file_size = os.path.getsize(attachment_path)
                             if file_size == request.attachment_size:
                                 self._pending.pop(rid)
-                                await p2p_respond(
-                                    self._socket, cid, rid, protocol, request, attachment_path, download_path=tempdir
-                                )
+                                self._spawn(self._dispatch_respond(
+                                    cid, rid, protocol, request,
+                                    attachment_path=attachment_path, download_path=tempdir,
+                                ))
 
                             elif file_size > request.attachment_size:
                                 log.warning('server', 'Attachment bigger than expected, ignoring', protocol=request.protocol)
@@ -230,7 +284,21 @@ class P2PService:
                         log.warning('server', 'Exception in server loop', exc=e)
 
         finally:
-            # Ensure socket is always closed and signal completion
+            # Give in-flight handlers a brief window to finish their sends
+            # before we tear down the socket. Anything still pending after
+            # the drain window is cancelled — better a truncated reply than
+            # a hung shutdown.
+            if self._inflight:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*list(self._inflight), return_exceptions=True),
+                        timeout=2.0,
+                    )
+                except asyncio.TimeoutError:
+                    for t in list(self._inflight):
+                        if not t.done():
+                            t.cancel()
+
             log.info('server', 'Stopped listening for P2P connections')
             with self._mutex:
                 if self._socket is not None:

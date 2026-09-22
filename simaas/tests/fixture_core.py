@@ -61,8 +61,16 @@ class TestContext:
             # In production, call await node.leave_network() and await node.shutdown_rti() first
             node.shutdown()
 
+        # Remove only this context's own directory. This used to rmtree the shared
+        # parent (~/testing), which destroyed the working directories of any other
+        # concurrently running pytest session -- and deleted a $HOME directory this
+        # fixture does not own. Prune the parent only if we left it empty.
         try:
-            shutil.rmtree(self._temp_testing_dir)
+            shutil.rmtree(self.testing_dir)
+            try:
+                os.rmdir(self._temp_testing_dir)
+            except OSError:
+                pass  # parent not empty (another session is using it) - leave it
         except OSError as e:
             trace = ''.join(traceback.format_exception(None, e, e.__traceback__))
             log.error(f"exception during cleanup() -> {e} {trace}")

@@ -475,3 +475,77 @@ async def test_namespace_reserve_cancel(test_context):
     assert await nodes[0].db.cancel_namespace_reservation(namespace, "job002") is True
     for node in nodes:
         assert len((await node.db.get_namespace(namespace)).reservations) == 0
+
+
+@pytest.mark.asyncio
+async def test_namespace_reserve_non_raising(test_context):
+    """reserve_namespace_resources(raise_on_fail=False) returns True/False instead of raising."""
+    namespace = 'ns_non_raising'
+    budget = ResourceDescriptor(vcpus=2, memory=2048)
+
+    keystore = Keystore.new("keystore_nr", "email")
+    node = test_context.get_node(
+        keystore, enable_rest=True, dor_plugin_class=FilesystemDORService, rti_plugin_class=None
+    )
+    await node.db.update_namespace_budget(namespace, budget)
+
+    # first reservation fits -> True, and it's recorded
+    ok = await node.db.reserve_namespace_resources(
+        namespace, "j1", ResourceDescriptor(vcpus=1, memory=1024), raise_on_fail=False
+    )
+    assert ok is True
+    assert "j1" in (await node.db.get_namespace(namespace)).reservations
+
+    # second reservation exceeds remaining budget -> False, and no side effect
+    ok = await node.db.reserve_namespace_resources(
+        namespace, "j2", ResourceDescriptor(vcpus=2, memory=2048), raise_on_fail=False
+    )
+    assert ok is False
+    assert "j2" not in (await node.db.get_namespace(namespace)).reservations
+
+    # default behaviour still raises so callers who never adopt the queue keep working
+    with pytest.raises(OperationError):
+        await node.db.reserve_namespace_resources(
+            namespace, "j3", ResourceDescriptor(vcpus=2, memory=2048)
+        )
+    assert "j3" not in (await node.db.get_namespace(namespace)).reservations
+
+
+@pytest.mark.integration
+def test_rest_concurrent_gets(module_node, module_nodedb_proxy):
+    """
+    Regression test: async handlers that ran sync SQLite queries directly on
+    the event loop would stall uvicorn's accept-loop under bursty concurrent
+    load. The OS TCP backlog (kern.ipc.somaxconn=128 on macOS) would then
+    silently drop excess SYNs, causing clients to fail before ever reaching
+    the server. All async DB handlers now dispatch their SQL work via
+    asyncio.to_thread so the accept-loop never blocks.
+
+    This test fires N HTTP requests in parallel against the same endpoints the
+    scale-up demo hammers (identity, network, identities) and asserts every
+    single one succeeds.
+    """
+    import concurrent.futures
+    from simaas.core.errors import RemoteError
+
+    n = 200
+    endpoints = [
+        module_nodedb_proxy.get_identities,
+        module_nodedb_proxy.get_network,
+        lambda: module_nodedb_proxy.get_identity(module_node.identity.id),
+    ]
+
+    def one_call(i: int):
+        try:
+            return endpoints[i % len(endpoints)]()
+        except (RemoteError, Exception) as e:  # capture *any* client-side failure
+            return e
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=n) as pool:
+        results = list(pool.map(one_call, range(n)))
+
+    failures = [(i, r) for i, r in enumerate(results) if isinstance(r, Exception)]
+    assert not failures, (
+        f"{len(failures)}/{n} concurrent REST requests failed. First 3: "
+        f"{failures[:3]}"
+    )

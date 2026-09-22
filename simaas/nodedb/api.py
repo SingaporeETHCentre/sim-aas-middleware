@@ -12,6 +12,32 @@ DB_ENDPOINT_PREFIX = "/api/v1/db"
 
 
 class NodeDBService(abc.ABC):
+    def get_p2p_protocols(self, node) -> list:
+        """P2P protocols this service exposes on the node's P2P bus.
+
+        Called once by ``Node.startup()`` before the P2P service is started.
+        Subclasses (including out-of-tree plugins) extend the list by overriding
+        and chaining via ``super().get_p2p_protocols(node)``.
+        """
+        from simaas.nodedb.protocol import (
+            P2PUpdateIdentity, P2PJoinNetwork, P2PLeaveNetwork,
+            P2PGetIdentity, P2PGetNetwork,
+            P2PReserveNamespaceResources, P2PCancelNamespaceReservation,
+            P2PUpdateNamespaceBudget,
+        )
+        from simaas.namespace.protocol import P2PNamespaceServiceCall
+        return [
+            P2PUpdateIdentity(node),
+            P2PJoinNetwork(node),
+            P2PLeaveNetwork(node),
+            P2PGetIdentity(node),
+            P2PGetNetwork(node),
+            P2PReserveNamespaceResources(node),
+            P2PCancelNamespaceReservation(node),
+            P2PUpdateNamespaceBudget(node),
+            P2PNamespaceServiceCall(node),
+        ]
+
     def endpoints(self) -> List[EndpointDefinition]:
         return [
             EndpointDefinition('GET', DB_ENDPOINT_PREFIX, 'node',
@@ -101,9 +127,12 @@ class NodeDBService(abc.ABC):
         """
 
     @abc.abstractmethod
-    async def reserve_namespace_resources(self, name: str, job_id: str, resources: ResourceDescriptor) -> None:
+    async def reserve_namespace_resources(self, name: str, job_id: str, resources: ResourceDescriptor,
+                                          raise_on_fail: bool = True) -> bool:
         """
-        Attempts to reserve namespace resources for a job.
+        Attempts to reserve namespace resources for a job. When raise_on_fail is True (default), raises
+        OperationError if the reservation cannot be satisfied; when False, returns False instead so the
+        caller can decide (e.g. leave the job queued). Returns True on success.
         """
 
     @abc.abstractmethod

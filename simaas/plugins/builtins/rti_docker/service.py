@@ -67,7 +67,7 @@ class DockerRTIService(RTIServiceBase):
             protocol = P2PLookupDataObject(self._node)
             custodian = None
             proc_obj = None
-            for node in [node for node in await self._node.db.get_network() if node.dor_service and node.dor_service.lower() != 'none']:
+            for node in [node for node in await self._node.db.get_network() if node.has_dor()]:
                 result: Dict[str, DataObject] = await protocol.perform(node, [proc.id])
                 proc_obj = result.get(proc.id)
                 if proc_obj:
@@ -144,8 +144,8 @@ class DockerRTIService(RTIServiceBase):
                 proc_path=proc_obj.tags['proc_path'], proc_descriptor=proc_obj.tags['proc_descriptor']
             )
 
-            # update the db record
-            self.update_proc_db(proc)
+            # update the db record (offload sync SQLAlchemy work)
+            await asyncio.to_thread(self.update_proc_db, proc)
 
         except Exception as e:
             log.error('deploy', 'Deployment failed', exc=e, proc=proc.id)
@@ -153,8 +153,8 @@ class DockerRTIService(RTIServiceBase):
             proc.state = Processor.State.FAILED
             proc.error = str(e)
 
-            # update the db record
-            self.update_proc_db(proc)
+            # update the db record (offload sync SQLAlchemy work)
+            await asyncio.to_thread(self.update_proc_db, proc)
 
     async def perform_undeploy(self, proc: Processor, keep_image: bool = True) -> None:
         # remove the docker image (if applicable)
@@ -165,14 +165,16 @@ class DockerRTIService(RTIServiceBase):
             except Exception as e:
                 log.error('undeploy', 'Failed to delete docker image', exc=e, proc=proc.id, image=proc.image_name)
 
-        # remove the record from the db - no lock needed, session is per-call
-        with self._session_maker() as session:
-            record = session.get(DBDeployedProcessor, proc.id)
-            if record:
-                session.delete(record)
-                session.commit()
-            else:
-                log.warning('undeploy', 'DB record not found for removal', proc=proc.id)
+        # remove the record from the db - offloaded to keep the event loop free
+        def _sync_delete() -> None:
+            with self._session_maker() as session:
+                record = session.get(DBDeployedProcessor, proc.id)
+                if record:
+                    session.delete(record)
+                    session.commit()
+                else:
+                    log.warning('undeploy', 'DB record not found for removal', proc=proc.id)
+        await asyncio.to_thread(_sync_delete)
 
     def _perform_submit(
             self, job: Job, proc: Processor, submitted: Optional[List[Tuple[Job, str]]] = None
@@ -251,14 +253,19 @@ class DockerRTIService(RTIServiceBase):
         runner_iid: str = None
         try:
             # mark cancelled in DB first (state is correct even if we crash later)
-            self.mark_job_cancelled(job_id)
+            await asyncio.to_thread(self.mark_job_cancelled, job_id)
 
-            # get container_id and runner identity (quick read, don't hold session)
-            with self._session_maker() as session:
-                record = session.get(DBJobInfo, job_id)
-                container_id = record.runner.get('container_id') if record else None
-                if record and record.runner.get('identity'):
-                    runner_iid = record.runner['identity'].get('id')
+            # get container_id and runner identity (quick read, don't hold session).
+            # Offloaded so the sync SQL work doesn't sit on the event loop.
+            def _sync_read() -> Tuple[Optional[str], Optional[str]]:
+                with self._session_maker() as session:
+                    record = session.get(DBJobInfo, job_id)
+                    cid = record.runner.get('container_id') if record else None
+                    riid = record.runner['identity'].get('id') if (
+                        record and record.runner.get('identity')
+                    ) else None
+                    return cid, riid
+            container_id, runner_iid = await asyncio.to_thread(_sync_read)
 
             if not container_id:
                 return
@@ -308,26 +315,27 @@ class DockerRTIService(RTIServiceBase):
             log.warning('purge', 'Killing Docker container failed', job=record.id, container=record.runner.get('container_id'))
 
     async def perform_job_cleanup(self, job_id: str) -> None:
-        runner_iid: str = None
+        runner_iid: Optional[str] = None
         try:
-            with self._session_maker() as session:
-                record: DBJobInfo = session.get(DBJobInfo, job_id)
+            # Snapshot the needed fields on a worker thread so we don't hold
+            # the DB session open across the awaits below.
+            def _sync_read() -> Tuple[Optional[str], Optional[str]]:
+                with self._session_maker() as session:
+                    record: DBJobInfo = session.get(DBJobInfo, job_id)
+                    if record is None:
+                        return None, None
+                    _riid = record.runner['identity'].get('id') if record.runner.get('identity') else None
+                    _cid = record.runner.get('container_id')
+                    return _riid, _cid
+            runner_iid, container_id = await asyncio.to_thread(_sync_read)
 
-                # extract runner identity ID for later deletion
-                if record.runner.get('identity'):
-                    runner_iid = record.runner['identity'].get('id')
-
-                # only clean up container/scratch if we are not supposed to keep the job history
-                if not self.retain_job_history:
-                    # wait for docker container to be shutdown
-                    container_id: str = record.runner['container_id']
-                    log.info('cleanup', 'Waiting for container to stop', job=job_id, container=container_id)
-                    while await asyncio.to_thread(docker_container_running, container_id):
-                        await asyncio.sleep(1)
-
-                    # delete the container
-                    log.info('cleanup', 'Deleting container', job=job_id, container=container_id)
-                    await asyncio.to_thread(docker_delete_container, container_id)
+            # only clean up container/scratch if we are not supposed to keep the job history
+            if not self.retain_job_history and container_id is not None:
+                log.info('cleanup', 'Waiting for container to stop', job=job_id, container=container_id)
+                while await asyncio.to_thread(docker_container_running, container_id):
+                    await asyncio.sleep(1)
+                log.info('cleanup', 'Deleting container', job=job_id, container=container_id)
+                await asyncio.to_thread(docker_delete_container, container_id)
 
             # delete the scratch folder (if any and not retaining history)
             if not self.retain_job_history and self._scratch_volume is not None:

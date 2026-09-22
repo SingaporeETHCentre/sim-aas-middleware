@@ -1,7 +1,7 @@
 ########################################
 # -------- 1. Builder stage ----------
 ########################################
-FROM python:3.12.10-slim-bullseye AS builder
+FROM python:3.12.10-slim-bookworm AS builder
 
 # for logging
 ARG TARGETPLATFORM
@@ -32,7 +32,7 @@ RUN /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
 ########################################
 # -------- 2. Runtime stage ----------
 ########################################
-FROM python:3.12.10-slim-bullseye
+FROM python:3.12.10-slim-bookworm
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends git \
