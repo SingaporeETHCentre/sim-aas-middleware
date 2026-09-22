@@ -7,17 +7,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-
-def _sqlite_connect_args(db_path: str) -> dict:
-    """SQLite connections default to rejecting use from a thread other than the
-    one that created them. We now dispatch DB work via asyncio.to_thread so
-    connections are pulled from the pool on worker threads; disable the check
-    so any pooled connection can serve any worker thread. Safe because a
-    SQLAlchemy Session serialises access within itself."""
-    if db_path.startswith("sqlite"):
-        return {"check_same_thread": False}
-    return {}
-
 from simaas.core.helpers import get_timestamp_now
 from simaas.core.identity import Identity
 from simaas.core.logging import get_logger
@@ -28,6 +17,17 @@ from simaas.nodedb.protocol import NodeDBSnapshot, P2PCancelNamespaceReservation
 from simaas.nodedb.schemas import NodeInfo, NamespaceInfo, ResourceDescriptor
 
 log = get_logger('simaas.nodedb', 'nodedb')
+
+
+def _sqlite_connect_args(db_path: str) -> dict:
+    """SQLite connections default to rejecting use from a thread other than the
+    one that created them. We now dispatch DB work via asyncio.to_thread so
+    connections are pulled from the pool on worker threads; disable the check
+    so any pooled connection can serve any worker thread. Safe because a
+    SQLAlchemy Session serialises access within itself."""
+    if db_path.startswith("sqlite"):
+        return {"check_same_thread": False}
+    return {}
 
 
 def _parse_rest_address(addr_str: str) -> Tuple[str, int]:
