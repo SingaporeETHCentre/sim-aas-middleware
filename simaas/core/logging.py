@@ -110,7 +110,6 @@ class Logger:
             max_duplicates=int(os.environ.get('SIMAAS_LOG_RATE_LIMIT_MAX', '5'))
         )
         self._rate_limit_enabled = os.environ.get('SIMAAS_LOG_RATE_LIMIT', 'true').lower() == 'true'
-        self._debug_mode = os.environ.get('SIMAAS_DEBUG', 'false').lower() == 'true'
 
     def _shorten_id(self, id_value: str) -> str:
         """Shorten long IDs to first4..last4 format."""
@@ -178,8 +177,11 @@ class Logger:
             if suppressed > 0:
                 formatted = f"{formatted} (suppressed {suppressed} similar messages)"
 
-        # Add exception traceback if in debug mode and exception provided
-        if exc is not None and self._debug_mode:
+        # Add the exception traceback whenever one is provided. A caller passing
+        # exc= is explicitly saying this exception matters, so dropping it loses the
+        # only record of why something failed. This used to be gated on debug mode,
+        # which reduced unhandled handler errors to a bare one-line message.
+        if exc is not None:
             tb = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
             formatted = f"{formatted}\n{tb}"
 
@@ -198,20 +200,21 @@ class Logger:
         else:
             self._log(logging.INFO, component_or_message, message, **kwargs)
 
-    def warning(self, component_or_message: str, message: str = None, **kwargs) -> None:
-        """Log a warning message.
+    def warning(self, component_or_message: str, message: str = None, exc: Optional[Exception] = None,
+                **kwargs) -> None:
+        """Log a warning message, optionally including an exception traceback.
 
         Can be called in two ways:
-        - warning(component, message, **kwargs) - structured format
+        - warning(component, message, exc=..., **kwargs) - structured format
         - warning(message) - freeform format
         """
         if message is None:
             self._logger.warning(component_or_message)
         else:
-            self._log(logging.WARNING, component_or_message, message, **kwargs)
+            self._log(logging.WARNING, component_or_message, message, exc=exc, **kwargs)
 
     def error(self, component_or_message: str, message: str = None, exc: Optional[Exception] = None, **kwargs) -> None:
-        """Log an error message, optionally including exception traceback in debug mode.
+        """Log an error message, optionally including an exception traceback.
 
         Can be called in two ways:
         - error(component, message, exc=..., **kwargs) - structured format
