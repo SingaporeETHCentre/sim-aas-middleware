@@ -257,14 +257,6 @@ def test_cli_image_build_local(docker_available, temp_dir):
 
 
 
-@pytest.mark.skip(
-    reason="Temporarily disabled: hangs. Builds with arch='linux/amd64', so the "
-           "image is built under emulation on arm64 hosts, and it clones "
-           "REPOSITORY_URL (sec-digital-twin-lab) at the local HEAD commit, which "
-           "does not exist in that repo now that development moved to "
-           "SingaporeETHCentre. Re-enable once REPOSITORY_URL points at the new "
-           "repo and it is public."
-)
 def test_cli_image_build_github(docker_available, temp_dir):
     """Test CLI image build from GitHub repository."""
     if not docker_available:

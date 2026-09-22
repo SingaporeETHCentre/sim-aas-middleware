@@ -38,7 +38,6 @@ from simaas.tests.fixture_core import CURRENT_COMMIT_ID
 log = get_logger('tests.fixtures.rti', 'test')
 
 # Constants
-REPOSITORY_URL = 'https://github.com/sec-digital-twin-lab/sim-aas-middleware'
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 # Processor paths

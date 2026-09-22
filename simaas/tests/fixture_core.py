@@ -25,7 +25,7 @@ from simaas.plugins.builtins.rti_aws.service import get_default_aws_config
 
 load_dotenv()
 
-REPOSITORY_URL = 'https://github.com/sec-digital-twin-lab/sim-aas-middleware'
+REPOSITORY_URL = os.environ.get('SIMAAS_REPO_PATH') or str(BASE_DIR)
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 # Constant tag for test images - tests always use local builds
