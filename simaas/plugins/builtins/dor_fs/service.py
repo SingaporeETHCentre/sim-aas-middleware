@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import shutil
 from stat import S_IREAD, S_IRGRP
 from threading import Lock
@@ -15,7 +16,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.ext.mutable import MutableDict, MutableList
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-from simaas.core.helpers import hash_string_object, hash_json_object, hash_file_content
+from simaas.core.helpers import hash_json_object, hash_file_content
 from simaas.dor.api import DORProxy, DORRESTService
 from simaas.core.errors import NotFoundError, OperationError
 from simaas.core.helpers import get_timestamp_now, generate_random_string
@@ -355,9 +356,16 @@ class FilesystemDORService(DORRESTService):
         if recipe is not None:
             recipe.product.c_hash = c_hash
 
-        # determine the object id
+        # determine the object id. NOT derived from the content: c_hash is the
+        # content-addressed identifier and handles dedup/ref-counting. obj_id only
+        # has to uniquely identify this registration. token_hex(32) keeps the same
+        # 64-char lowercase-hex shape as the old sha256 id. It used to be a hash over
+        # (c_hash, data_type, data_format, creators_iid, created_t) -- but concurrent
+        # registrations of identical content differ only in created_t, which is
+        # millisecond resolution, so two of them in the same millisecond collided on
+        # 'UNIQUE constraint failed: obj_record.obj_id'.
         created_t = get_timestamp_now()
-        obj_id = hash_string_object(f"{c_hash}{data_type}{data_format}{''.join(creators_iid)}{created_t}").hex()
+        obj_id = secrets.token_hex(32)
 
         # DB write + local filesystem move under the db mutex — offloaded so
         # the event loop stays free to accept new HTTP requests. Filesystem
