@@ -106,16 +106,13 @@ SIMAAS_AWS_JOB_QUEUE=simaas-queue
 
 ## Async Tests
 
-Some tests use `pytest-asyncio`:
+There are none. As of 5.0.0 async was removed from the codebase (uvicorn excepted),
+along with the `pytest-asyncio` dependency and `simaas.core.async_helpers`. Every test
+is an ordinary synchronous function.
 
-```bash
-# Run async tests
-.venv/bin/python -m pytest simaas/tests/test_p2p.py -v
-```
-
-**Patterns**:
-- Use `@pytest.mark.asyncio` decorator for async test functions
-- Use `run_coro_safely()` from `simaas.core.async_helpers` when calling coroutines from sync context
+If you are porting a test from a 4.x branch, drop `@pytest.mark.asyncio`, turn
+`async def` into `def`, remove `await`, and replace `run_coro_safely(x)` with a plain
+call to `x` - the APIs it used to bridge are themselves synchronous now.
 
 ## Test Waves
 
@@ -130,13 +127,13 @@ containers at all, so they run anywhere, while waves 4-6 are gated on
 
 | Wave | Contents | Tests | Approx. time | Requires |
 |------|----------|-------|--------------|----------|
-| **0 - Images** (opt-in) | `test_cli_image.py` | 5 | ~20 min | Docker |
-| **1 - Unit** | `test_unit_core.py`, `test_unit_helpers.py`, `test_errors.py`, `test_logging.py`, `test_cli_helpers.py`, `test_proc_worker.py` | 176 | ~15 s | nothing |
-| **2 - Services** | `test_dor.py`, `test_nodedb.py`, `test_p2p.py`, `test_rest.py`, `test_rest_errors.py` | 67 | ~2.5 min | in-process nodes |
+| **0 - Images** (opt-in) | `test_cli_image.py` | 5 | ~13.5 min | Docker |
+| **1 - Unit** | `test_unit_core.py`, `test_unit_helpers.py`, `test_errors.py`, `test_logging.py`, `test_cli_helpers.py` | 165 | ~15 s | nothing |
+| **2 - Services** | `test_dor.py`, `test_nodedb.py`, `test_p2p.py`, `test_rest.py`, `test_rest_errors.py` | 63 | ~1 min | in-process nodes |
 | **3 - CLI** | `test_cli_dor.py`, `test_cli_identity.py`, `test_cli_runner.py` | 20 | ~1 min | in-process nodes |
-| **4 - Node/Docker** | `test_namespace.py`, `test_cli_gateway.py`, `test_cli_misc.py`, `test_fork_safety.py` | 27 | ~1.5 min | Docker |
-| **5 - RTI** | `test_rti.py`, `test_rti_2node.py`, `test_cli_rti.py` | 40 | ~9 min | Wave 0 images |
-| **6 - Processors** | `test_processor_*.py` (6 files) | 50 | ~4 min | Wave 0 images |
+| **4 - Node/Docker** | `test_namespace.py`, `test_cli_gateway.py`, `test_cli_misc.py` | 24 | ~1 min | Docker |
+| **5 - RTI** | `test_rti.py`, `test_rti_2node.py`, `test_cli_rti.py` | 40 | ~12 min | Wave 0 images |
+| **6 - Processors** | `test_processor_*.py` (6 files) | 50 | ~3.5 min | Wave 0 images |
 
 Not in any wave: `test_ssh_tunnel.py` (4 tests) - AWS-only, skips without
 `SSH_TUNNEL_*` credentials.
@@ -156,7 +153,7 @@ below).
 # Wave 1 - unit; no Docker, no nodes. Fastest useful gate.
 .venv/bin/python -m pytest simaas/tests/test_unit_core.py simaas/tests/test_unit_helpers.py \
     simaas/tests/test_errors.py simaas/tests/test_logging.py \
-    simaas/tests/test_cli_helpers.py simaas/tests/test_proc_worker.py -v
+    simaas/tests/test_cli_helpers.py -v
 
 # Wave 2 - services
 .venv/bin/python -m pytest simaas/tests/test_dor.py simaas/tests/test_nodedb.py \
@@ -168,7 +165,7 @@ below).
 
 # Wave 4 - node behaviour requiring Docker
 .venv/bin/python -m pytest simaas/tests/test_namespace.py simaas/tests/test_cli_gateway.py \
-    simaas/tests/test_cli_misc.py simaas/tests/test_fork_safety.py -v
+    simaas/tests/test_cli_misc.py -v
 
 # Wave 5 - RTI (requires Wave 0 images)
 .venv/bin/python -m pytest simaas/tests/test_rti.py simaas/tests/test_rti_2node.py \
@@ -180,10 +177,8 @@ below).
 
 ### Notes on individual waves
 
-- **Wave 1** is the cheapest meaningful signal: 176 tests in about 30 seconds with
-  no Docker and no node startup (measured: 14 s). `test_fork_safety.py` deliberately sits in Wave 4
-  instead - it is Docker-gated and builds a `linux/amd64` image, which costs
-  minutes on Apple Silicon under Rosetta.
+- **Wave 1** is the cheapest meaningful signal: 165 tests in about 12 seconds with
+  no Docker and no node startup. Run it before every commit.
 - **Wave 5** parametrises `rti_context` over `[docker, aws]`. The `[aws]`
   variants skip unless AWS is configured, so a Docker-only run reports 11 skips.
 - **Wave 6** contains `test_processor_kgraph_job`, which depends on the
@@ -195,8 +190,8 @@ below).
 For current test timings, coverage details, and recommended timeouts, see `TEST_STATS.md` in the repository root.
 
 **Summary**:
-- **Total tests**: 389 collected (385 in waves 0-6, plus 4 AWS-only)
-- **Total runtime**: ~18 minutes for waves 1-6; ~20 minutes more if Wave 0 runs
+- **Total tests**: 371 collected (367 in waves 0-6, plus 4 AWS-only)
+- **Total runtime**: ~18 minutes for waves 1-6; ~13.5 minutes more if Wave 0 runs
 - **Coverage**: 82% (target: 80%)
 
 > Note: `TEST_STATS.md` still reports 160 tests / ~19 minutes and is out of date.
