@@ -94,6 +94,12 @@ def search_data_objects(
         _handle_error(e)
 
 
+def _read_upload(attachment: UploadFile) -> bytes:
+    """Read an UploadFile's content synchronously."""
+    attachment.file.seek(0)
+    return attachment.file.read()
+
+
 @app.post("/gateway/v1/data")
 def upload_data_object(
     body: str = Form(...), attachment: UploadFile = File(...),
@@ -123,7 +129,7 @@ def upload_data_object(
         with httpx.Client() as client:
             form_data = {
                 'body': (None, json.dumps(dor_body), 'application/json'),
-                'attachment': (attachment.filename, attachment.read(), attachment.content_type)
+                'attachment': (attachment.filename, _read_upload(attachment), attachment.content_type)
             }
             response = client.post(url, headers=headers, files=form_data)
             response.raise_for_status()

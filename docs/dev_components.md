@@ -396,55 +396,44 @@ simaas-cli
 
 ## Node Lifecycle (`simaas/node/`)
 
-The `Node` class is the central orchestrator that manages all services. It has a clear separation between **sync** operations (thread lifecycle management) and **async** operations (application logic).
+The `Node` class is the central orchestrator that manages all services. Its API is
+**fully synchronous**: the P2P and REST services run in their own daemon threads, and
+every method below blocks until its work is done.
 
-### Async/Sync Boundary
+> Earlier releases exposed `startup()`, `join_network()`, `leave_network()`,
+> `shutdown_rti()` and `update_identity()` as coroutines requiring `asyncio.run()` or
+> `await`. As of 5.0.0 async has been removed from the codebase (uvicorn excepted) and
+> those calls are plain method calls.
 
-| Layer | Methods | Purpose |
-|-------|---------|---------|
-| **Sync** | `shutdown()` | Stop daemon threads |
-| **Async** | `startup()`, `join_network()`, `leave_network()`, `shutdown_rti()`, `update_identity()` | Daemon start and network operations |
-
-### Sync Methods (Thread Lifecycle)
+### Methods
 
 ```python
+def startup(self, p2p_address: str, rest_address: Tuple[str, int] = None,
+            bind_all_address: bool = False, wait_until_ready: bool = True) -> None:
+    """Start P2P and REST daemon threads, wait for services to be ready."""
+
+def join_network(self, boot_node_address: Tuple[str, int]) -> None:
+    """Join the P2P network via a boot node."""
+
+def leave_network(self, blocking: bool = False) -> None:
+    """Inform peers and leave the network."""
+
+def shutdown_rti(self, timeout: int = 60) -> None:
+    """Undeploy all processors and wait for workers to finish."""
+
+def update_identity(self, name: str = None, email: str = None,
+                    propagate: bool = True) -> Identity:
+    """Update identity and optionally broadcast to peers."""
+
 def shutdown(self) -> None:
     """Stop P2P and REST daemon threads."""
 ```
 
-### Async Methods (Application Logic)
-
-```python
-async def startup(self, p2p_address: str, rest_address: Tuple[str, int] = None,
-                  bind_all_address: bool = False, wait_until_ready: bool = True) -> None:
-    """Start P2P and REST daemon threads, wait for services to be ready."""
-```
-
-```python
-async def join_network(self, boot_node_address: Tuple[str, int]) -> None:
-    """Join the P2P network via a boot node."""
-
-async def leave_network(self, blocking: bool = False) -> None:
-    """Inform peers and leave the network."""
-
-async def shutdown_rti(self, timeout: int = 60) -> None:
-    """Undeploy all processors and wait for workers to finish."""
-
-async def update_identity(self, name: str = None, email: str = None,
-                          propagate: bool = True) -> Identity:
-    """Update identity and optionally broadcast to peers."""
-```
-
-### Usage Patterns
-
-**Pattern A: Script/CLI (no existing event loop)**
-
-Use `asyncio.run()` to execute async operations from sync code:
+### Usage
 
 ```python
 from simaas.node.default import DefaultNode
 from simaas.core.keystore import Keystore
-import asyncio
 
 # Create and configure node
 keystore = Keystore.load("path/to/keystore", password="secret")
@@ -452,60 +441,27 @@ node = DefaultNode(keystore, "path/to/datastore", enable_db=True,
                    dor_plugin_class=FilesystemDORService,
                    rti_plugin_class=DockerRTIService)
 
-# Async: Start daemon services
-asyncio.run(node.startup("tcp://0.0.0.0:4000", rest_address=("0.0.0.0", 5000)))
+# Start daemon services
+node.startup("tcp://0.0.0.0:4000", rest_address=("0.0.0.0", 5000))
 
-# Async: Join network (if connecting to existing network)
-asyncio.run(node.join_network(("192.168.1.100", 5000)))
+# Join network (if connecting to an existing network)
+node.join_network(("192.168.1.100", 5000))
 
-# ... application runs ...
-
-# Async: Clean shutdown
-asyncio.run(node.leave_network())
-asyncio.run(node.shutdown_rti())
-
-# Sync: Stop daemon services
-node.shutdown()
-```
-
-**Pattern B: Async Application (existing event loop)**
-
-When running inside an async context (e.g., pytest-asyncio, async web framework):
-
-```python
-async def main():
-    # Create and configure node
-    keystore = Keystore.load("path/to/keystore", password="secret")
-    node = DefaultNode(keystore, "path/to/datastore", enable_db=True,
-                       dor_plugin_class=FilesystemDORService,
-                       rti_plugin_class=DockerRTIService)
-
-    # Async: Start daemon services (runs in background threads)
-    await node.startup("tcp://0.0.0.0:4000", rest_address=("0.0.0.0", 5000))
-
-    # Async: Join network
-    await node.join_network(("192.168.1.100", 5000))
-
-    try:
-        # ... application runs ...
-        await some_async_work()
-    finally:
-        # Async: Clean shutdown
-        await node.leave_network()
-        await node.shutdown_rti()
-
-        # Sync: Stop daemon services
-        node.shutdown()
-
-asyncio.run(main())
+try:
+    ...  # application runs
+finally:
+    # Clean shutdown
+    node.leave_network()
+    node.shutdown_rti()
+    node.shutdown()
 ```
 
 ### Design Rationale
 
-The P2P and REST services run in their own daemon threads with isolated event loops because:
+The P2P and REST services run in their own daemon threads because they are
+long-running servers: they continuously accept connections independent of
+application logic, and isolating them keeps that work off the calling thread.
 
-1. **Long-running servers**: They continuously accept connections independent of application logic
-2. **Thread isolation**: Prevents blocking the main application's event loop
-3. **Clean separation**: Thread management is inherently sync; network I/O is naturally async
-
-This design allows the Node to be used in both sync scripts and async applications without nested event loop issues.
+Keeping the Node API synchronous means callers need no event loop of their own.
+The only async left in the codebase is inside uvicorn/FastAPI, which manages its
+own loop within the REST daemon thread and does not surface to callers.

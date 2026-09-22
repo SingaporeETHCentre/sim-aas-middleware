@@ -276,18 +276,6 @@ class TestLoggerFormat:
 class TestEnvironmentVariables:
     """Tests for environment variable handling."""
 
-    def test_debug_mode_default_off(self):
-        """Debug mode should be off by default."""
-        with patch.dict(os.environ, {}, clear=True):
-            logger = Logger('test', 'test')
-            assert logger._debug_mode is False
-
-    def test_debug_mode_enabled(self):
-        """Debug mode should be enabled via SIMAAS_DEBUG."""
-        with patch.dict(os.environ, {'SIMAAS_DEBUG': 'true'}):
-            logger = Logger('test', 'test')
-            assert logger._debug_mode is True
-
     def test_rate_limit_default_on(self):
         """Rate limiting should be on by default."""
         with patch.dict(os.environ, {}, clear=True):
@@ -386,9 +374,13 @@ class TestLoggerMethods:
         assert 'ERROR' in caplog.text
         assert '[test.component] Test error' in caplog.text
 
-    def test_error_with_exception_debug_off(self, caplog):
-        """error() with exception should not include traceback when debug is off."""
-        with patch.dict(os.environ, {'SIMAAS_DEBUG': 'false'}):
+    def test_error_with_exception_includes_traceback(self, caplog):
+        """error() with exception always includes the traceback.
+
+        This used to be gated behind SIMAAS_DEBUG, which silently discarded the
+        only record of why a handler failed.
+        """
+        with patch.dict(os.environ, {}, clear=True):
             logger = Logger('test', 'test')
             try:
                 raise ValueError('test error')
@@ -396,17 +388,22 @@ class TestLoggerMethods:
                 with caplog.at_level(logging.ERROR):
                     logger.error('component', 'Error occurred', exc=e)
 
-        assert 'Traceback' not in caplog.text
+        assert 'Traceback' in caplog.text
+        assert 'ValueError' in caplog.text
 
-    def test_error_with_exception_debug_on(self, caplog):
-        """error() with exception should include traceback when debug is on."""
-        with patch.dict(os.environ, {'SIMAAS_DEBUG': 'true'}):
+    def test_warning_with_exception_includes_traceback(self, caplog):
+        """warning() with exception includes the traceback too.
+
+        p2p/service.py logs unhandled handler exceptions at WARNING, so this path
+        matters as much as error().
+        """
+        with patch.dict(os.environ, {}, clear=True):
             logger = Logger('test', 'test')
             try:
                 raise ValueError('test error')
             except ValueError as e:
-                with caplog.at_level(logging.ERROR):
-                    logger.error('component', 'Error occurred', exc=e)
+                with caplog.at_level(logging.WARNING):
+                    logger.warning('component', 'Warning occurred', exc=e)
 
         assert 'Traceback' in caplog.text
         assert 'ValueError' in caplog.text

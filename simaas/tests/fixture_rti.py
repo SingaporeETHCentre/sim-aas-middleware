@@ -38,7 +38,6 @@ from simaas.tests.fixture_core import CURRENT_COMMIT_ID
 log = get_logger('tests.fixtures.rti', 'test')
 
 # Constants
-REPOSITORY_URL = 'https://github.com/sec-digital-twin-lab/sim-aas-middleware'
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 # Processor paths
@@ -248,8 +247,11 @@ def add_test_processor(
             with open(gpp_path, 'w') as f:
                 json.dump(gpp.model_dump(), f, indent=2)
 
-            # get the credentials
-            credentials = (os.environ['GITHUB_USERNAME'], os.environ['GITHUB_TOKEN'])
+            # only needed if the Dockerfile consumes the git_credentials
+            # BuildKit secret to clone a private repo
+            credentials = None
+            if {'GITHUB_USERNAME', 'GITHUB_TOKEN'}.issubset(os.environ):
+                credentials = (os.environ['GITHUB_USERNAME'], os.environ['GITHUB_TOKEN'])
 
             # build the image from the isolated temp copy
             build_processor_image(
@@ -310,6 +312,30 @@ def wait_for_processor_undeployed(rti_proxy: RTIProxy, proc_id: str, timeout: fl
             # Exception likely means processor not found (undeployed)
             return
         time.sleep(1)
+
+
+# ==============================================================================
+# Volume Reference Factory (backend-overridable)
+# ==============================================================================
+
+@pytest.fixture
+def deploy_volume_factory():
+    """Context-manager factory yielding a ``ProcessorVolume`` for the
+    deploy-with-volume tests. Default is a Docker bind-mount; downstream
+    RTI test suites override this fixture to return a backend-appropriate
+    reference shape.
+    """
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _factory(name: str = 'data_volume', mount_point: str = '/data'):
+        with tempfile.TemporaryDirectory() as tempdir:
+            yield ProcessorVolume(
+                name=name, mount_point=mount_point, read_only=False,
+                reference={'path': tempdir},
+            )
+
+    return _factory
 
 
 # ==============================================================================
@@ -708,19 +734,16 @@ def rti_context(
     deployed_abc_processor,
     deployed_room_processor,
     deployed_thermostat_processor,
-    # AWS fixtures
-    aws_session_node,
-    aws_rti_proxy,
-    aws_dor_proxy,
-    aws_node_db_proxy,
-    aws_deployed_abc_processor,
-    aws_deployed_room_processor,
-    aws_deployed_thermostat_processor,
 ) -> RTIContext:
     """Parameterized fixture providing RTI context for either Docker or AWS backend.
 
     Tests using this fixture will automatically run twice: once for Docker
     and once for AWS. Test output will show as test_name[docker] and test_name[aws].
+
+    The AWS fixtures are resolved lazily via request.getfixturevalue() rather than
+    declared as parameters. As parameters they were set up for BOTH params, so the
+    docker variant pulled in ssh_tunnel, which skips when SSH_TUNNEL_* is unset -
+    taking the whole Docker RTI tier down with it.
     """
     if request.param == "docker":
         if not docker_available:
@@ -741,12 +764,12 @@ def rti_context(
             pytest.skip("AWS is not available")
         return RTIContext(
             backend="aws",
-            session_node=aws_session_node,
-            rti_proxy=aws_rti_proxy,
-            dor_proxy=aws_dor_proxy,
-            node_db_proxy=aws_node_db_proxy,
-            deployed_abc_processor=aws_deployed_abc_processor,
-            deployed_room_processor=aws_deployed_room_processor,
-            deployed_thermostat_processor=aws_deployed_thermostat_processor,
+            session_node=request.getfixturevalue("aws_session_node"),
+            rti_proxy=request.getfixturevalue("aws_rti_proxy"),
+            dor_proxy=request.getfixturevalue("aws_dor_proxy"),
+            node_db_proxy=request.getfixturevalue("aws_node_db_proxy"),
+            deployed_abc_processor=request.getfixturevalue("aws_deployed_abc_processor"),
+            deployed_room_processor=request.getfixturevalue("aws_deployed_room_processor"),
+            deployed_thermostat_processor=request.getfixturevalue("aws_deployed_thermostat_processor"),
             default_memory=2048,
         )

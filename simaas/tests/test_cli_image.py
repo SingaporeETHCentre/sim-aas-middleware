@@ -50,6 +50,17 @@ def temp_dir():
         yield tempdir
 
 
+def _github_credentials():
+    """GitHub credentials are optional: they are only needed if the Dockerfile
+    consumes the git_credentials BuildKit secret to clone a private repo.
+    Mirrors the guarded lookups in fixture_rti.py and cli/cmd_image.py - reaching
+    into os.environ directly raised KeyError('GITHUB_USERNAME') and failed every
+    test in this file when the credentials were absent."""
+    if {'GITHUB_USERNAME', 'GITHUB_TOKEN'}.issubset(os.environ):
+        return os.environ['GITHUB_USERNAME'], os.environ['GITHUB_TOKEN']
+    return None
+
+
 def _get_image_name(proc_name: str) -> str:
     """Get the full Docker image name for a processor."""
     org = 'sec-digital-twin-lab'
@@ -112,7 +123,7 @@ def _build_processor(proc_info: tuple, force_build: bool = True) -> dict:
             # Build the image from the isolated temp copy
             build_processor_image(
                 temp_proc_path, os.environ['SIMAAS_REPO_PATH'], image_name,
-                credentials=(os.environ['GITHUB_USERNAME'], os.environ['GITHUB_TOKEN']),
+                credentials=_github_credentials(),
                 platform='linux/amd64',
                 force_build=force_build
             )
@@ -148,7 +159,7 @@ def test_helper_image_clone_build_export(docker_available, session_node, temp_di
 
     try:
         clone_repository(REPOSITORY_URL+"_doesnt_exist", os.path.join(temp_dir, 'repository_doesnt_exist'),
-                         credentials=(os.environ['GITHUB_USERNAME'], os.environ['GITHUB_TOKEN']))
+                         credentials=_github_credentials())
         assert False
     except CLIError:
         assert True

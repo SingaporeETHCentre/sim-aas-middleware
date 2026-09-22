@@ -25,8 +25,8 @@ from simaas.plugins.builtins.rti_aws.service import get_default_aws_config
 
 load_dotenv()
 
-REPOSITORY_URL = 'https://github.com/sec-digital-twin-lab/sim-aas-middleware'
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
+REPOSITORY_URL = os.environ.get('SIMAAS_REPO_PATH') or str(BASE_DIR)
 
 # Constant tag for test images - tests always use local builds
 CURRENT_COMMIT_ID = 'LOCAL_LATEST'
@@ -60,8 +60,16 @@ class TestContext:
             # In production, call node.leave_network() and node.shutdown_rti() first
             node.shutdown()
 
+        # Remove only this context's own directory. This used to rmtree the shared
+        # parent (~/testing), which destroyed the working directories of any other
+        # concurrently running pytest session -- and deleted a $HOME directory this
+        # fixture does not own. Prune the parent only if we left it empty.
         try:
-            shutil.rmtree(self._temp_testing_dir)
+            shutil.rmtree(self.testing_dir)
+            try:
+                os.rmdir(self._temp_testing_dir)
+            except OSError:
+                pass  # parent not empty (another session is using it) - leave it
         except OSError as e:
             trace = ''.join(traceback.format_exception(None, e, e.__traceback__))
             log.error(f"exception during cleanup() -> {e} {trace}")
