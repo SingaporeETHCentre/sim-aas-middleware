@@ -18,8 +18,9 @@ log.info('job', 'Job submitted to processor', job=job_id, proc=proc_id)
 log.warning('', 'Peer timed out', addr=peer_addr, elapsed_ms=5000)
 # Output: [rti] Peer timed out | addr=192.168.1.5 elapsed_ms=5000
 
-# With exception (traceback included only when SIMAAS_DEBUG=true)
+# With exception (the traceback is always included)
 log.error('job', 'Job execution failed', exc=e, job=job_id)
+log.warning('server', 'Handler task raised', exc=e, protocol=protocol.name())
 
 # Debug is freeform (no component required)
 log.debug('Checking peer availability', peer=peer_id, attempt=3)
@@ -30,7 +31,8 @@ log.debug('Checking peer availability', peer=peer_id, attempt=3)
 - **First argument** (`component`): Sub-tag appended to the subsystem. Use `''` to omit.
 - **Second argument** (`message`): Human-readable sentence describing what happened.
 - **Keyword arguments**: Structured data appended as `key=value` pairs after `|`.
-- **`exc` keyword** (error only): Exception instance. Traceback is included when `SIMAAS_DEBUG=true`.
+- **`exc` keyword** (`error` and `warning`): Exception instance. The traceback is always included -
+  it is never suppressed, since passing `exc` means the exception is worth recording.
 
 ## Auto ID Shortening
 
@@ -106,7 +108,6 @@ INFO and DEBUG messages are never rate-limited.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SIMAAS_DEBUG` | `false` | Include exception tracebacks in logs |
 | `SIMAAS_LOG_RATE_LIMIT` | `true` | Enable rate limiting for WARNING/ERROR |
 | `SIMAAS_LOG_RATE_LIMIT_WINDOW` | `60` | Rate limit window in seconds |
 | `SIMAAS_LOG_RATE_LIMIT_MAX` | `5` | Max duplicates before suppression |

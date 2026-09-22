@@ -8,6 +8,7 @@ RTI execution, validation edge cases, and provenance tracking.
 import json
 import logging
 import os
+import random
 import tempfile
 
 import pytest
@@ -404,16 +405,20 @@ def test_defg_provenance_chain(
     proc_id = deployed_defg_processor.obj_id
     owner = session_node.keystore
 
-    # Create initial data object d0 = {"v": 1}
+    # Create initial data object d0 = {"v": <random 1..10>}. The start value is
+    # randomised because provenance is keyed by content hash: a fixed start made
+    # this chain's outputs collide with identical content produced by other tests,
+    # and get_provenance() then returned that other object's record instead.
+    start_val = random.randint(1, 10)
     d0_path = test_context.create_file_with_content(
-        f"{generate_random_string(4)}.json", json.dumps({'v': 1})
+        f"{generate_random_string(4)}.json", json.dumps({'v': start_val})
     )
     d0 = dor_proxy.add_data_object(
         d0_path, owner.identity, False, False, 'JSONObject', 'json'
     )
 
     prev_obj = d0
-    expected_val = 1
+    expected_val = start_val
     produced_objects = []
 
     for i in range(3):
