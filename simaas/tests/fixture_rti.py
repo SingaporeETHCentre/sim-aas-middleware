@@ -736,19 +736,16 @@ def rti_context(
     deployed_abc_processor,
     deployed_room_processor,
     deployed_thermostat_processor,
-    # AWS fixtures
-    aws_session_node,
-    aws_rti_proxy,
-    aws_dor_proxy,
-    aws_node_db_proxy,
-    aws_deployed_abc_processor,
-    aws_deployed_room_processor,
-    aws_deployed_thermostat_processor,
 ) -> RTIContext:
     """Parameterized fixture providing RTI context for either Docker or AWS backend.
 
     Tests using this fixture will automatically run twice: once for Docker
     and once for AWS. Test output will show as test_name[docker] and test_name[aws].
+
+    The AWS fixtures are resolved lazily via request.getfixturevalue() rather than
+    declared as parameters. As parameters they were set up for BOTH params, so the
+    docker variant pulled in ssh_tunnel, which skips when SSH_TUNNEL_* is unset -
+    taking the whole Docker RTI tier down with it.
     """
     if request.param == "docker":
         if not docker_available:
@@ -769,12 +766,12 @@ def rti_context(
             pytest.skip("AWS is not available")
         return RTIContext(
             backend="aws",
-            session_node=aws_session_node,
-            rti_proxy=aws_rti_proxy,
-            dor_proxy=aws_dor_proxy,
-            node_db_proxy=aws_node_db_proxy,
-            deployed_abc_processor=aws_deployed_abc_processor,
-            deployed_room_processor=aws_deployed_room_processor,
-            deployed_thermostat_processor=aws_deployed_thermostat_processor,
+            session_node=request.getfixturevalue("aws_session_node"),
+            rti_proxy=request.getfixturevalue("aws_rti_proxy"),
+            dor_proxy=request.getfixturevalue("aws_dor_proxy"),
+            node_db_proxy=request.getfixturevalue("aws_node_db_proxy"),
+            deployed_abc_processor=request.getfixturevalue("aws_deployed_abc_processor"),
+            deployed_room_processor=request.getfixturevalue("aws_deployed_room_processor"),
+            deployed_thermostat_processor=request.getfixturevalue("aws_deployed_thermostat_processor"),
             default_memory=2048,
         )
