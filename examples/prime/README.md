@@ -31,7 +31,7 @@ This setup demonstrates how to:
   - Computes and returns all factors of `N` in that range.
 
 ## Running the Example using Python
-Test cases with working code can be found in [test_example_primes.py](../../simaas/tests/test_example_primes.py).
+Test cases with working code can be found in [test_processor_primes.py](../../simaas/tests/test_processor_primes.py).
 
 ## Running the Example using the CLI
 > This example assumes you have a Sim-aaS Node instance running, read the documentation

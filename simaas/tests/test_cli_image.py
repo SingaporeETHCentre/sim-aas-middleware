@@ -63,9 +63,10 @@ def _github_credentials():
 
 def _get_image_name(proc_name: str) -> str:
     """Get the full Docker image name for a processor."""
-    org = 'sec-digital-twin-lab'
+    org = 'SingaporeETHCentre'
     repo_name = 'sim-aas-middleware'
-    return f'{org}/{repo_name}/{proc_name}:{CURRENT_COMMIT_ID}'
+    # docker requires image repository names to be lowercase
+    return f'{org.lower()}/{repo_name}/{proc_name}:{CURRENT_COMMIT_ID}'
 
 
 def _build_processor(proc_info: tuple, force_build: bool = True) -> dict:

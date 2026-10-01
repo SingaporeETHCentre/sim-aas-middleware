@@ -10,7 +10,7 @@ This project has not yet had external contributors. If you're interested in cont
 
 ```bash
 # Clone the repository
-git clone https://github.com/sec-digital-twin-lab/sim-aas-middleware.git
+git clone https://github.com/SingaporeETHCentre/sim-aas-middleware.git
 cd sim-aas-middleware
 
 # Create a virtual environment

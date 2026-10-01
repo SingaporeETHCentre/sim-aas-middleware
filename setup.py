@@ -30,10 +30,10 @@ setup(
     },
     packages=find_packages(),
     include_package_data=True,
-    url='https://github.com/sec-digital-twin-lab/sim-aas-middleware',
+    url='https://github.com/SingaporeETHCentre/sim-aas-middleware',
     project_urls={
-        'Source': 'https://github.com/sec-digital-twin-lab/sim-aas-middleware',
-        'Tracker': 'https://github.com/sec-digital-twin-lab/sim-aas-middleware/issues',
+        'Source': 'https://github.com/SingaporeETHCentre/sim-aas-middleware',
+        'Tracker': 'https://github.com/SingaporeETHCentre/sim-aas-middleware/issues',
     },
     license='MIT',
     description=_locals["__description__"],
@@ -45,7 +45,7 @@ setup(
         ]
     },
     classifiers=[
-        'Programming Language :: Python :: 3'
-        'Operating System :: OS Independent'
+        'Programming Language :: Python :: 3',
+        'Operating System :: OS Independent',
     ],
 )

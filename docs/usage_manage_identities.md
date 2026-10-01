@@ -137,7 +137,7 @@ The dialogue will ask information about the GitHub username and the personal acc
 ```
 ? Select the keystore: test/test@test.com/hm9jatxdtcmr6vo3qrcye5lut7f4j8aeunaue6i3ehruajedv4cbk2qa1tzin1cf
 ? Enter password: ****
-? Enter repository URL: https://github.com/sec-digital-twin-lab/sim-aas-middleware
+? Enter repository URL: https://github.com/SingaporeETHCentre/sim-aas-middleware
 ? Enter login: <USERNAME>
 ? Enter personal access token: <TOKEN>
 Credential successfully created.
@@ -152,7 +152,7 @@ In the dialogue, select the credentials you want to test:
 ```
 ? Select the keystore: test/test@test.com/hm9jatxdtcmr6vo3qrcye5lut7f4j8aeunaue6i3ehruajedv4cbk2qa1tzin1cf
 ? Enter password: ****
-? Select repository URL: https://github.com/sec-digital-twin-lab/sim-aas-middleware
-repo_name: sec-digital-twin-lab/sim-aas-middleware
+? Select repository URL: https://github.com/SingaporeETHCentre/sim-aas-middleware
+repo_name: SingaporeETHCentre/sim-aas-middleware
 Github credentials test successful.
 ```

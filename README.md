@@ -11,7 +11,7 @@ of federations of computational models.
 
 Clone the repository:
 ```shell
-git clone https://github.com/sec-digital-twin-lab/sim-aas-middleware
+git clone https://github.com/SingaporeETHCentre/sim-aas-middleware
 cd sim-aas-middleware
 ```
 

@@ -161,9 +161,10 @@ class ProcessorDeployment:
 
     def _get_image_name(self) -> str:
         """Get the full Docker image name for this processor."""
-        org = 'sec-digital-twin-lab'
+        org = 'SingaporeETHCentre'
         repo_name = 'sim-aas-middleware'
-        return f'{org}/{repo_name}/{self.proc_name}:{CURRENT_COMMIT_ID}'
+        # docker requires image repository names to be lowercase
+        return f'{org.lower()}/{repo_name}/{self.proc_name}:{CURRENT_COMMIT_ID}'
 
     def __enter__(self) -> DataObject:
         """Deploy processor, requiring image to be pre-built by Wave 0."""
@@ -212,10 +213,11 @@ def add_test_processor(
     """
     import shutil
 
-    org = 'sec-digital-twin-lab'
+    org = 'SingaporeETHCentre'
     repo_name = 'sim-aas-middleware'
     repo_url = f'https://github.com/{org}/{repo_name}'
-    image_name = f'{org}/{repo_name}/{proc_name}:{CURRENT_COMMIT_ID}'
+    # docker requires image repository names to be lowercase
+    image_name = f'{org.lower()}/{repo_name}/{proc_name}:{CURRENT_COMMIT_ID}'
 
     # does it exist in DOR? if not, build and add it
     result = dor.search(data_type='ProcessorDockerImage')

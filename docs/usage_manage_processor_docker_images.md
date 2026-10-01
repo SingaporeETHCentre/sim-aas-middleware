@@ -33,7 +33,7 @@ difference between processors that are part of a Git repository and those that a
 Example for PDI meta information for processor part of a Git repository:
 ```
 "proc_path": "examples/simple/abc",
-"repository": "https://github.com/sec-digital-twin-lab/sim-aas-middleware",
+"repository": "https://github.com/SingaporeETHCentre/sim-aas-middleware",
 "commit_id": "e81119ada241cd9047e3e6799c932a73f1f7bddc",
 "content_hash": "b3cb3eac16889a6b3881cb3086dc0ea652e1888e55c7ae18f3a1293caa681b6b",
 "is_git_repo": true,
@@ -155,7 +155,7 @@ Appending PDI meta information: {
     ]
   },
   "proc_path": "examples/simple/abc",
-  "repository": "https://github.com/sec-digital-twin-lab/sim-aas-middleware",
+  "repository": "https://github.com/SingaporeETHCentre/sim-aas-middleware",
   "commit_id": "e81119ada241cd9047e3e6799c932a73f1f7bddc",
   "content_hash": "b3cb3eac16889a6b3881cb3086dc0ea652e1888e55c7ae18f3a1293caa681b6b",
   "is_git_repo": true,
@@ -169,12 +169,12 @@ The `build-github` command generates a PDI file from a GitHub repository. It clo
 repository, checks out a specific commit, and then performs the same build operations as
 `build-local`. Example:
 ```shell
-simaas-cli image build-github --repository https://github.com/sec-digital-twin-lab/sim-aas-middleware --commit-id e81119ada241cd9047e3e6799c932a73f1f7bddc --proc-path examples/simple/abc --arch linux/amd64 --verbose /Users/foobar/Desktop
+simaas-cli image build-github --repository https://github.com/SingaporeETHCentre/sim-aas-middleware --commit-id e81119ada241cd9047e3e6799c932a73f1f7bddc --proc-path examples/simple/abc --arch linux/amd64 --verbose /Users/foobar/Desktop
 
-Using repository at https://github.com/sec-digital-twin-lab/sim-aas-middleware with commit id e81119ada241cd9047e3e6799c932a73f1f7bddc.
+Using repository at https://github.com/SingaporeETHCentre/sim-aas-middleware with commit id e81119ada241cd9047e3e6799c932a73f1f7bddc.
 Using processor path 'examples/simple/abc'.
 Not using any GitHub credentials.
-Done cloning https://github.com/sec-digital-twin-lab/sim-aas-middleware.
+Done cloning https://github.com/SingaporeETHCentre/sim-aas-middleware.
 SHA256 hash of processor contents: b74a64c3f7492578fcb46c2df533e446900bb555deb6de6651db43016ee835da
 Using PDI file destination at '/Users/foobar/Desktop/proc-abc_b74a64c3f7492578fcb46c2df533e446900bb555deb6de6651db43016ee835da.pdi'.
 Begin building PDI 'proc-abc:b74a64c3f7492578fcb46c2df533e446900bb555deb6de6651db43016ee835da'. This may take a while...
@@ -240,7 +240,7 @@ Appending PDI meta information: {
     ]
   },
   "proc_path": "examples/simple/abc",
-  "repository": "https://github.com/sec-digital-twin-lab/sim-aas-middleware",
+  "repository": "https://github.com/SingaporeETHCentre/sim-aas-middleware",
   "commit_id": "e81119ada241cd9047e3e6799c932a73f1f7bddc",
   "content_hash": "b74a64c3f7492578fcb46c2df533e446900bb555deb6de6651db43016ee835da",
   "is_git_repo": true,

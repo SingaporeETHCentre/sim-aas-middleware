@@ -30,14 +30,14 @@ This setup demonstrates how to:
   - Supports cancellation during computation.
 
 ## Running the Example using Python
-Test cases with working code can be found in [test_example_abc.py](../../simaas/tests/test_example_abc.py).
+Test cases with working code can be found in [test_processor_abc.py](../../../simaas/tests/test_processor_abc.py).
 
 ## Running the Example using the CLI
 > This example assumes you have a Sim-aaS Node instance running, read the documentation
-> [here](../../docs/usage_run_simaas_node.md) to learn how to do that.
+> [here](../../../docs/usage_run_simaas_node.md) to learn how to do that.
 
 > If you have not already done so, read the documentation on the build command
-> [here](../../docs/usage_manage_processor_docker_images.md).
+> [here](../../../docs/usage_manage_processor_docker_images.md).
 
 > Processor Docker Images depend on the sim-aas-middleware repository. At the time of writing,
 > this repository is private. Ensure the following environment variables are set with access
