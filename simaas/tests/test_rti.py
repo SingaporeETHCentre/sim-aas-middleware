@@ -12,7 +12,6 @@ from typing import Union, Optional, List
 
 import pytest
 
-from simaas.core.async_helpers import run_coro_safely
 
 from simaas.core.identity import Identity
 from simaas.core.helpers import generate_random_string
@@ -470,9 +469,9 @@ def test_job_provenance_tracking(rti_context: RTIContext, test_context):
         )
 
         # wait until the job is done
-        status: JobStatus = run_coro_safely(rti.get_job_status(job.id))
+        status: JobStatus = rti.get_job_status(job.id)
         while status.state not in [JobStatus.State.SUCCESSFUL, JobStatus.State.CANCELLED, JobStatus.State.FAILED]:
-            status: JobStatus = run_coro_safely(rti.get_job_status(job.id))
+            status: JobStatus = rti.get_job_status(job.id)
             time.sleep(0.5)
 
         obj_c = status.output['c']
@@ -531,9 +530,9 @@ def test_job_concurrent_execution(rti_context: RTIContext, test_context, n: int 
             logprint(idx, f"[{idx}] [{time.time()}] job {job.id} submitted: {os.path.join(rti._jobs_path, job.id)}")
 
             # wait until the job is done
-            status: JobStatus = run_coro_safely(rti.get_job_status(job.id))
+            status: JobStatus = rti.get_job_status(job.id)
             while status.state not in [JobStatus.State.SUCCESSFUL, JobStatus.State.CANCELLED, JobStatus.State.FAILED]:
-                status: JobStatus = run_coro_safely(rti.get_job_status(job.id))
+                status: JobStatus = rti.get_job_status(job.id)
                 time.sleep(1.0)
 
             logprint(idx, f"[{idx}] [{time.time()}] job {job.id} finished: {status.state}")
@@ -815,7 +814,7 @@ def test_namespace_resource_limits(rti_context: RTIContext):
 
     # test with namespace that has not enough resources for a single task
     namespace0 = 'namespace0'
-    run_coro_safely(rti_context.session_node.db.update_namespace_budget(namespace0, ResourceDescriptor(vcpus=1, memory=mem // 2)))
+    rti_context.session_node.db.update_namespace_budget(namespace0, ResourceDescriptor(vcpus=1, memory=mem // 2))
 
     # get the tasks for namespace0 and try to submit jobs to namespace0 -> should fail
     tasks = get_cosim_tasks(
@@ -833,9 +832,9 @@ def test_namespace_resource_limits(rti_context: RTIContext):
     namespace1 = 'namespace1'
     namespace2 = 'namespace2'
     namespace3 = 'namespace3'
-    run_coro_safely(rti_context.session_node.db.update_namespace_budget(namespace1, ResourceDescriptor(vcpus=1, memory=mem)))
-    run_coro_safely(rti_context.session_node.db.update_namespace_budget(namespace2, ResourceDescriptor(vcpus=2, memory=mem)))
-    run_coro_safely(rti_context.session_node.db.update_namespace_budget(namespace3, ResourceDescriptor(vcpus=2, memory=mem * 2)))
+    rti_context.session_node.db.update_namespace_budget(namespace1, ResourceDescriptor(vcpus=1, memory=mem))
+    rti_context.session_node.db.update_namespace_budget(namespace2, ResourceDescriptor(vcpus=2, memory=mem))
+    rti_context.session_node.db.update_namespace_budget(namespace3, ResourceDescriptor(vcpus=2, memory=mem * 2))
 
     # get the tasks for namespace1 and try to submit jobs to namespace1 -> should fail
     tasks = get_cosim_tasks(
@@ -904,9 +903,9 @@ def test_queue_single_jobs_fifo(rti_context: RTIContext):
     rti = rti_context.session_node.rti
 
     ns = 'queue_fifo'
-    run_coro_safely(rti_context.session_node.db.update_namespace_budget(
+    rti_context.session_node.db.update_namespace_budget(
         ns, ResourceDescriptor(vcpus=1, memory=mem)
-    ))
+    )
 
     def submit_slow(name: str, sleep_secs: int) -> Job:
         # abc processor sleeps 'a' seconds then 'b' seconds before writing c
@@ -928,14 +927,14 @@ def test_queue_single_jobs_fifo(rti_context: RTIContext):
     # give job1 a moment to grab the reservation and job2/job3 to be persisted as queued
     time.sleep(1.0)
 
-    ns_info = run_coro_safely(rti_context.session_node.db.get_namespace(ns))
+    ns_info = rti_context.session_node.db.get_namespace(ns)
     reserved = set(ns_info.reservations.keys())
     assert job1.id in reserved, "first job should hold the reservation"
     assert job2.id not in reserved and job3.id not in reserved, "extras should be queued, not reserved"
 
     # queued jobs must have no container yet
     for j in (job2, job3):
-        st = run_coro_safely(rti.get_job_status(j.id))
+        st = rti.get_job_status(j.id)
         assert st.state == JobStatus.State.UNINITIALISED, f"{j.id} unexpectedly {st.state}"
 
     # once job1 finishes, job2 should be admitted; then job3
@@ -944,7 +943,7 @@ def test_queue_single_jobs_fifo(rti_context: RTIContext):
     wait_for_job_completion(rti_context.rti_proxy, job3.id, owner, timeout=60)
 
     for j in (job1, job2, job3):
-        st = run_coro_safely(rti.get_job_status(j.id))
+        st = rti.get_job_status(j.id)
         assert st.state == JobStatus.State.SUCCESSFUL, f"{j.id} ended in {st.state}"
 
 
@@ -960,9 +959,9 @@ def test_queue_batch_rejected_when_budget_short(rti_context: RTIContext):
 
     ns = 'queue_batch_reject'
     # budget fits 2 tasks in isolation, but not concurrently with a single already-holding job
-    run_coro_safely(rti_context.session_node.db.update_namespace_budget(
+    rti_context.session_node.db.update_namespace_budget(
         ns, ResourceDescriptor(vcpus=2, memory=mem * 2)
-    ))
+    )
 
     # occupy the namespace with a long-running single job holding half the budget
     hog = (TaskBuilder(proc_id, owner.identity.id)
@@ -992,7 +991,7 @@ def test_queue_batch_rejected_when_budget_short(rti_context: RTIContext):
     assert 'batch' in reason or 'batch' in details or 'admit' in reason or 'admit' in details
 
     # after rejection, no partial reservation should linger from the batch
-    ns_info = run_coro_safely(rti_context.session_node.db.get_namespace(ns))
+    ns_info = rti_context.session_node.db.get_namespace(ns)
     assert set(ns_info.reservations.keys()) == {hog_job.id}, \
         f"unexpected reservations after batch rejection: {ns_info.reservations}"
 

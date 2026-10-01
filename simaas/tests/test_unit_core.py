@@ -249,7 +249,7 @@ def test_add_get_object_key(temp_directory):
 
 def test_add_credentials(temp_directory):
     """Test keystore credentials management."""
-    url = 'https://github.com/sec-digital-twin-lab/saas-middleware'
+    url = 'https://github.com/SingaporeETHCentre/sim-aas-middleware'
     login = 'johndoe'
     personal_access_token = 'token'
     host = '192.168.0.1'

@@ -47,7 +47,7 @@ from the RTI and connects to it.
 4. The loop continues for a predefined number of steps or until cancelled.
 
 ## Running the Example using Python
-Test cases with working code can be found in [test_example_cosim.py](../../simaas/tests/test_example_cosim.py).
+Test cases with working code can be found in [test_processor_cosim.py](../../simaas/tests/test_processor_cosim.py).
 
 ## Running the Example using the CLI
 > This example assumes you have a Sim-aaS Node instance running, read the documentation

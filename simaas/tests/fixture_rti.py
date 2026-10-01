@@ -13,7 +13,6 @@ from typing import Type
 
 import pytest
 
-from simaas.core.async_helpers import run_coro_safely
 
 import docker
 
@@ -39,7 +38,6 @@ from simaas.tests.fixture_core import CURRENT_COMMIT_ID
 log = get_logger('tests.fixtures.rti', 'test')
 
 # Constants
-REPOSITORY_URL = 'https://github.com/sec-digital-twin-lab/sim-aas-middleware'
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 # Processor paths
@@ -163,9 +161,10 @@ class ProcessorDeployment:
 
     def _get_image_name(self) -> str:
         """Get the full Docker image name for this processor."""
-        org = 'sec-digital-twin-lab'
+        org = 'SingaporeETHCentre'
         repo_name = 'sim-aas-middleware'
-        return f'{org}/{repo_name}/{self.proc_name}:{CURRENT_COMMIT_ID}'
+        # docker requires image repository names to be lowercase
+        return f'{org.lower()}/{repo_name}/{self.proc_name}:{CURRENT_COMMIT_ID}'
 
     def __enter__(self) -> DataObject:
         """Deploy processor, requiring image to be pre-built by Wave 0."""
@@ -214,10 +213,11 @@ def add_test_processor(
     """
     import shutil
 
-    org = 'sec-digital-twin-lab'
+    org = 'SingaporeETHCentre'
     repo_name = 'sim-aas-middleware'
     repo_url = f'https://github.com/{org}/{repo_name}'
-    image_name = f'{org}/{repo_name}/{proc_name}:{CURRENT_COMMIT_ID}'
+    # docker requires image repository names to be lowercase
+    image_name = f'{org.lower()}/{repo_name}/{proc_name}:{CURRENT_COMMIT_ID}'
 
     # does it exist in DOR? if not, build and add it
     result = dor.search(data_type='ProcessorDockerImage')
@@ -554,7 +554,7 @@ def aws_session_node(aws_available, ssh_tunnel, session_keystore, session_node):
             )
 
             # join the network using the session_node's REST address
-            run_coro_safely(_node.join_network(session_node.rest.address()))
+            _node.join_network(session_node.rest.address())
 
             yield _node
 

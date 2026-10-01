@@ -6,7 +6,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
 
-from simaas.core.async_helpers import run_coro_safely
 from docker.errors import ImageNotFound
 from git import Repo
 
@@ -64,9 +63,10 @@ def _github_credentials():
 
 def _get_image_name(proc_name: str) -> str:
     """Get the full Docker image name for a processor."""
-    org = 'sec-digital-twin-lab'
+    org = 'SingaporeETHCentre'
     repo_name = 'sim-aas-middleware'
-    return f'{org}/{repo_name}/{proc_name}:{CURRENT_COMMIT_ID}'
+    # docker requires image repository names to be lowercase
+    return f'{org.lower()}/{repo_name}/{proc_name}:{CURRENT_COMMIT_ID}'
 
 
 def _build_processor(proc_info: tuple, force_build: bool = True) -> dict:
@@ -258,14 +258,6 @@ def test_cli_image_build_local(docker_available, temp_dir):
 
 
 
-@pytest.mark.skip(
-    reason="Temporarily disabled: hangs. Builds with arch='linux/amd64', so the "
-           "image is built under emulation on arm64 hosts, and it clones "
-           "REPOSITORY_URL (sec-digital-twin-lab) at the local HEAD commit, which "
-           "does not exist in that repo now that development moved to "
-           "SingaporeETHCentre. Re-enable once REPOSITORY_URL points at the new "
-           "repo and it is public."
-)
 def test_cli_image_build_github(docker_available, temp_dir):
     """Test CLI image build from GitHub repository."""
     if not docker_available:
@@ -311,7 +303,7 @@ def test_cli_image_export_import(docker_available, session_node, temp_dir):
     keystore = Keystore.new('name', 'email', path=temp_dir, password=password)
 
     # ensure the node knows about this identity
-    run_coro_safely(session_node.db.update_identity(keystore.identity))
+    session_node.db.update_identity(keystore.identity)
 
     try:
         # define arguments

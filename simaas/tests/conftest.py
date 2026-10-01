@@ -1,6 +1,7 @@
 """Pytest configuration and shared fixtures."""
 
 import logging
+import os
 from pathlib import Path
 
 import pytest  # noqa: F401 - used by pytest
@@ -9,6 +10,8 @@ from dotenv import load_dotenv
 from simaas.core.logging import get_logger
 
 load_dotenv()
+
+os.environ.setdefault('GIT_TERMINAL_PROMPT', '0')
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
