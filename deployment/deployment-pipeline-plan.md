@@ -43,7 +43,7 @@ Each package can be done on its own once its dependencies are met. P1 to P3 need
 Depends on: nothing.
 
 - [ ] Work out the full node command with no prompts, using `--keystore`, `--keystore-id`, `--password`, `--dor fs`, `--rti aws`, `--datastore`, `--rest-address`, `--p2p-address`, `--boot-node`, `--simaas-repo-path`
-- [ ] Decide between explicit flags and `--profile prod` (which selects Docker, so `--rti aws` must override it)
+- [ ] Decide: write every flag out, or use `--profile prod` (a shortcut that sets several flags, including Docker as the job runtime) and override it with `--rti aws`
 - [ ] Work out the gateway command: `service gateway --address --datastore --service-address`
 - [ ] Confirm both start locally with no prompt
 
@@ -55,6 +55,7 @@ Depends on: P1.
 
 - [ ] Add a `deploy/` folder to this repo
 - [ ] Node start script: read the config file, fetch secrets from Secrets Manager, export the `SIMAAS_AWS_*` variables, start the node
+- [x] Decided: keystore password and AWS key pair live in Secrets Manager, nothing in files on the box
 - [ ] Gateway start script
 - [ ] Node unit: restart on failure, start after Docker and network
 - [ ] Gateway unit: start after the node
@@ -66,10 +67,10 @@ Done when: `systemctl start` brings both up and a reboot brings both back.
 
 Depends on: nothing.
 
-- [ ] Agree the tag format (for example `v4.3.0`)
+- [x] Tag format: `vX.Y.Z`, as already used (`v4.0.0` to `v4.3.0`)
 - [ ] Check the tag matches `__version__` in `simaas/meta.py`
 - [ ] Run lint and test waves 1 to 3 (no Docker needed, about 4 minutes)
-- [ ] Decide whether waves 4 to 6 also gate a release (Docker needed, about 15 minutes more)
+- [x] Decided: only waves 1 to 3 gate a release. Waves 4 to 6 run on `main` separately, not on tags
 
 Done when: a bad tag or failing test stops the workflow before any deploy step.
 
@@ -168,5 +169,6 @@ P1 → P2 → P3 → P4 → P5 → P6 → P7 → P8 → P9 → P10
 - **Processor images bake in middleware code:** after a middleware upgrade, deployed processors may run old code until rebuilt. See `docs/dev_testing.md`.
 - **Datastore across versions:** shell history on the old box shows `node.db` and `rti.db` being deleted after version changes. Test an upgrade against a copy of real data before trusting it.
 - **Password on the command line:** `--password` is a CLI flag, so it is visible in the process list on the box. Acceptable on a single-purpose instance; a middleware change could remove it.
+- **Processor image name ignores the middleware version:** the name is `<processor>:<hash of the processor folder>`. Rebuilding after a middleware upgrade gives the same name, so the build is skipped and the old image stays in use. Fix needed before processor rebuilds are automated; see `processor-deployment-notes.md`.
 - **Static AWS keys:** the AWS plugin requires an access key and secret as environment variables. Using the instance role instead needs a change in `simaas/plugins/builtins/rti_aws/service.py`.
 - **Restart interrupts work:** restarting the node stops anything it is coordinating.

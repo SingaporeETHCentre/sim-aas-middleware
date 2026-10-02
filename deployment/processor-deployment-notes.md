@@ -1,6 +1,6 @@
 # Processor deployment notes
 
-Written 2026-09-30. Status: discussion notes, nothing decided beyond what is marked as such.
+Written 2026-09-30, decisions added 2026-10-02. Open items are listed at the end.
 
 Follows on from `deployment-pipeline-plan.md` (middleware pipeline) and `simaas-ec2-deployment-findings.md` (state of the instance). This file covers the questions that came up about how processors fit into the picture.
 
@@ -66,7 +66,9 @@ Both workflows share the same OIDC deploy role and SSM path, set up once in P4.
 
 **Decided:** processor images are built on GitHub Actions and pushed to ECR from there, not on the instance.
 
-**Order:** middleware pipeline first (the processor pipeline needs a running node to deploy into, and shares its AWS plumbing), then the adapters workflow. Optionally later, the middleware workflow's last step triggers the adapters workflow to rebuild all processors.
+**Order:** middleware pipeline first (the processor pipeline needs a running node to deploy into, and shares its AWS plumbing), then the adapters workflow.
+
+**Decided:** after a middleware release, processors are rebuilt by hand: run the `sim-aas-adapters` workflow with the rebuild-all input. Chaining it from the end of the `sim-aas-middleware` workflow comes later, once both have run cleanly a few times.
 
 ## How processors are versioned today
 
@@ -95,12 +97,30 @@ Per-processor semver tags (`infrarisk-recovery/v1.2.0`) were the first idea, but
 1. **Keep content addressing, trigger on path change.** Push to `main` touching `infrarisk/recovery/**` builds that processor, pushes it to ECR under its hash, then imports and deploys it. The hash is the version. No naming decisions, matches how the CLI already works. **Recommended for now.**
 2. **Add a version to `descriptor.json`** and tag `<name>/vX.Y.Z`. Cleaner for humans, but it is a middleware change (descriptor schema and image naming) before it means anything.
 
+The flow for option 1, from a processor change to a job running on the new image:
+
+```mermaid
+flowchart LR
+    A[Push to main<br>touching a processor folder] --> B[GitHub Actions<br>builds that processor]
+    B --> C[Push image to ECR<br>tag = content hash]
+    C --> D[Import and deploy<br>on the node via SSM]
+    D --> E[Node references<br>the new image by hash]
+    E --> F[Next job: Batch submits,<br>Fargate pulls from ECR and runs]
+```
+
 Either way, one workflow file handles every processor. Per-processor workflows would be N copies of the same ECR push and SSM deploy. Build-all-on-every-change is out: images are 1–3 GB each, and redeploying a processor changes its identity on the node, so users would see every processor change when only one did.
 
 Also needed: a `workflow_dispatch` input to rebuild all (or a listed set of) processors against a given middleware version. That is the path a middleware release uses.
 
-## Open questions
+## Decisions
 
-- Which of the 38 processors should the pipeline cover? Only three are deployed. The `legacy-duct-fom` group is probably dead.
-- Which fix for the hash-vs-middleware problem: change the image naming, or force-build and delete on middleware release?
-- Whether the Dockerfiles should be made uniform (shared base image, or a template) before automating builds, or left as they are.
+- **Processors covered:** the three deployed ones, `ucm-cnrs`, `infrarisk-eqintensity`, `infrarisk-recovery`. Others are added by path when needed. `legacy-duct-fom` is excluded.
+- **Dockerfiles:** left as they are. The workflow runs `docker build` per folder, so they do not need to match.
+- **Secrets:** keystore password and AWS key pair in Secrets Manager.
+- **Processor rebuild after a middleware release:** by hand, see above.
+
+## Open
+
+- **Image name and middleware version.** A processor image contains the model code and a copy of the middleware. Its name is built from the model code only. After a middleware upgrade the name is unchanged, so the build is skipped and the old middleware stays inside the image. Two fixes:
+  1. Add the middleware version to the image name, for example `<name>:<hash>-4.3.0`. Change in `simaas/cli/cmd_image.py`. Recommended.
+  2. Keep the name, and have the workflow delete the ECR tag and force a rebuild on every middleware release.
