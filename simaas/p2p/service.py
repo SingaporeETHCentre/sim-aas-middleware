@@ -76,6 +76,7 @@ def _recv_exact(sock: ssl.SSLSocket, n: int) -> bytes:
 class _ThreadedSSLServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128
 
     def __init__(self, server_address: Tuple[str, int], handler_cls, ssl_ctx: ssl.SSLContext):
         super().__init__(server_address, handler_cls, bind_and_activate=True)
