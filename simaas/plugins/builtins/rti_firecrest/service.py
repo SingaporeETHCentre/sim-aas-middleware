@@ -270,10 +270,12 @@ class FirecRESTRTIService(RTIServiceBase):
                 log.warning('undeploy', 'DB record not found for removal', proc=proc.id)
 
     def _custodian_address(self) -> str:
+        # the address the job runner on the cluster uses to call home: the node's advertised P2P address, unless
+        # the cluster reaches the node under a different host name (e.g. through a tunnel or NAT)
         if "SIMAAS_CUSTODIAN_HOST" in os.environ:
             return f"tcp://{os.environ['SIMAAS_CUSTODIAN_HOST']}:{self._node.p2p.port()}"
         else:
-            return self._node.p2p.fq_address()
+            return self._node.p2p.address()
 
     def _job_script(self, job: Job, proc: Processor, port: int) -> str:
         job_path = self._remote_job_path(job.id)
