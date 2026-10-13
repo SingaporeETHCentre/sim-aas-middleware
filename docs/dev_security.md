@@ -35,20 +35,23 @@ Every identity consists of:
 |-----|-----------|---------|
 | Signing key | EC (ECDSA) | Authenticate requests via digital signatures |
 | Encryption key | RSA | Encrypt data object content |
-| Communication key | Curve25519 | Encrypt P2P communication channels |
+| TLS certificate | X.509 (EC P-256) | Identify a node when establishing P2P connections |
 
 Identities are stored in **keystores** -- encrypted files protected by a user password (PBKDF2 key
 derivation). The keystore's master key encrypts all other keys at rest.
 
 ### Identity Verification
 
-Identity IDs are derived from the SHA-256 hash of the canonical identity representation. This makes
-identities **self-verifying**: given an identity's public keys and profile, anyone can recompute the
-ID and verify it matches. No central authority is needed.
+An identity's ID is a random 64-character string, assigned when the keystore is created. Integrity
+does not come from the ID but from a signature: the signing key signs a token covering the ID,
+profile, nonce, and public keys, and `Identity.verify_integrity()` verifies it against the
+identity's own public signing key.
 
-This is inspired by cryptocurrency/blockchain patterns: identities are self-sovereign, actions
-require private-key signatures, and verification uses public keys. This enables cross-organisation
-trust without a central identity provider.
+The NodeDB rejects identity updates whose signature is invalid, and accepts an update only if its
+nonce is greater than the one already on record.
+
+Identities are self-sovereign: actions require private-key signatures and verification uses public
+keys, so cross-organisation trust needs no central identity provider.
 
 ## Authentication Flow
 
@@ -66,11 +69,12 @@ Key properties:
 
 | Channel | Encryption | Notes |
 |---------|-----------|-------|
-| P2P (ZMQ) | Curve25519 (CurveZMQ) | Encrypted and authenticated when curve keys are configured |
+| P2P | TLS 1.3 | Always on; the connecting node pins the peer's certificate |
 | REST API | None (HTTP) | Relies on trusted network; TLS can be added via reverse proxy |
 
-P2P communication between nodes uses CurveZMQ, which provides both encryption and authentication
-at the transport level. Each node's communication key is part of its identity.
+P2P communication between nodes runs over TLS 1.3. Each node holds a self-signed X.509 certificate
+(EC P-256) in its keystore and publishes it as part of its identity. When connecting to a peer, a
+node trusts that certificate and no other. There is no unencrypted P2P path.
 
 REST API traffic is unencrypted by default. This is acceptable for the intended deployment model
 (trusted internal network). For deployments that require encrypted REST traffic, place a TLS-
@@ -98,7 +102,7 @@ Data objects support owner-based access control:
 |-------|---------------|----------------|
 | Application | User authentication, account management, sessions | OAuth2, JWT, LDAP |
 | Middleware | Model identity, access control, data provenance, job governance | Cryptographic signatures |
-| Transport | Secure communication between nodes | CurveZMQ (P2P), HTTP/TLS (REST) |
+| Transport | Encrypted communication between nodes | TLS 1.3 (P2P), HTTP (REST) |
 
 ## Threat Model Assumptions
 

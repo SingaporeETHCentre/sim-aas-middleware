@@ -8,18 +8,26 @@ Provides foundational services for identity management, cryptography, and comput
 
 ### Identity Management
 
-Self-verifying cryptographic identities with multi-key cryptography:
+Cryptographic identities built from several key pairs:
 
 ```python
-class Identity:
-    """Public identity with verification capabilities"""
-    id: str           # SHA-256 hash of canonical identity representation
-    profile: IdentityProfile
-    public_keys: Dict[str, PublicKey]  # Signing (EC), Encryption (RSA), Communication (Curve25519)
-    signature: str
+class Identity(BaseModel):
+    """Record of public information about an identity."""
+    id: str                      # random 64-character id, assigned at keystore creation
+    name: str
+    email: str
+    s_public_key: str            # EC, for signature verification
+    e_public_key: str            # RSA, for encryption
+    tls_cert: str                # PEM-encoded self-signed X.509 cert, used for P2P
+    nonce: int                   # incremented on every update; higher nonce wins
+    signature: Optional[str]     # over the identity token (id, profile, nonce, public keys)
+    last_seen: Optional[int]
 
-    def verify(self) -> bool:
-        """Verify identity signature integrity"""
+    def verify(self, message: bytes, signature: str) -> bool:
+        """Verify a signature against this identity's public signing key"""
+
+    def verify_integrity(self) -> bool:
+        """Verify this identity record's own signature"""
 ```
 
 ### Keystore Security
@@ -27,22 +35,26 @@ class Identity:
 Hierarchical encryption with master key protection:
 
 ```python
-class Keystore:
-    """Secure storage for cryptographic materials and credentials"""
-    master_key: RSAKeyPair      # Root of trust, encrypted with password
-    signing_key: ECKeyPair      # For identity verification
-    encryption_key: RSAKeyPair  # For data encryption
-    communication_key: bytes    # ZeroMQ Curve key
-    content_keys: Dict[str, bytes]        # Per-data-object encryption
-    ssh_credentials: Dict[str, SSHKey]    # Git repository access
-    github_credentials: Dict[str, Token]  # GitHub API access
+# Required keystore assets. All except 'master-key' are encrypted with the master key.
+assets = {
+    'master-key':         MasterKeyPairAsset,      # RSA, encrypted with the user password
+    'signing-key':        KeyPairAsset,            # EC, signs keystore content + identity tokens
+    'encryption-key':     KeyPairAsset,            # RSA, encrypts/decrypts data payloads
+    'tls-cert':           TLSCertAsset,            # self-signed X.509 cert + key, used for P2P
+    'content-keys':       ContentKeysAsset,        # per-data-object symmetric keys
+    'ssh-credentials':    SSHCredentialsAsset,     # Git repository access
+    'github-credentials': GithubCredentialsAsset,  # GitHub API access
+}
 ```
+
+The TLS material is reached via `tls_cert_pem()`, `tls_key_pem()` and `tls_spki_hex()`; the
+certificate is also published as part of the node's identity.
 
 **Security Model**:
 1. Master key encrypted with user password using PBKDF2
 2. All other keys encrypted with master key
 3. Thread-safe with mutex protection
-4. Content keys derived from master key + content hash
+4. Content keys are generated per data object (Fernet) and stored in the `content-keys` asset
 
 ### Processor Framework
 
@@ -176,18 +188,20 @@ response = batch_client.submit_job(
 
 ## P2P Networking (`simaas/p2p/`)
 
-Secure, authenticated communication layer using ZeroMQ with Curve encryption.
+Peer-to-peer communication layer. Each message is a length-prefixed JSON header, optionally
+followed by a streamed binary attachment, sent over a TLS 1.3 connection.
 
-### Security Model
+### Transport Security
 
-Curve25519 encryption with identity verification:
+Certificates are pinned rather than issued by a CA (`simaas/p2p/base.py`):
 
 ```python
-socket.curve_secretkey = keystore.communication_key.secret
-socket.curve_publickey = keystore.communication_key.public
-socket.curve_server = True  # For servers
-socket.curve_serverkey = remote_public_key  # For clients
+build_client_ssl_context(peer_cert_pem)       # trusts the peer's published cert, and no other
+build_server_ssl_context(cert_pem, key_pem)   # presents this node's own cert from its keystore
 ```
+
+A node takes `peer_cert_pem` from the peer's `Identity.tls_cert`, so reaching a peer requires
+already knowing its identity.
 
 ### Protocol Framework
 
@@ -196,19 +210,49 @@ class P2PProtocol(ABC):
     """Base class for P2P protocols"""
 
     @abstractmethod
-    def handle_request(self, sender_iid: str, request: any) -> any:
-        """Process incoming request and return response"""
+    def handle(self, request: BaseModel,
+               attachment_path: Optional[str] = None,
+               download_path: Optional[str] = None
+               ) -> Tuple[Optional[BaseModel], Optional[str]]:
+        """Process an incoming request; return (reply, optional reply attachment path)"""
+
+    @staticmethod
+    def request_type() -> BaseModel: ...
+
+    @staticmethod
+    def response_type() -> Optional[BaseModel]: ...
 ```
 
 ### Built-in Protocols
 
-| Protocol | Purpose |
-|----------|---------|
-| `NetworkDiscoveryProtocol` | Discover available nodes and services |
-| `DORSearchProtocol` | Search for data objects across the network |
-| `DORFetchProtocol` | Fetch object content from remote nodes |
-| `IdentityPublishProtocol` | Publish identity updates |
-| `IdentityDiscoveryProtocol` | Discover identities by ID or pattern |
+A node registers the protocols of whichever services it runs, via each service's
+`get_p2p_protocols()`.
+
+| Protocol | Wire name | Purpose |
+|----------|-----------|---------|
+| `P2PUpdateIdentity` | `nodedb-update-id` | Push an identity update to a peer |
+| `P2PGetIdentity` | `nodedb-get-id` | Retrieve a single identity by id |
+| `P2PGetNetwork` | `nodedb-get-network` | Retrieve a peer's view of the network |
+| `P2PJoinNetwork` | `nodedb-join` | Exchange network snapshots when joining |
+| `P2PLeaveNetwork` | `nodedb-leave` | Announce departure from the network |
+| `P2PUpdateNamespaceBudget` | `nodedb-namespace-update` | Propagate a namespace budget change |
+| `P2PReserveNamespaceResources` | `nodedb-namespace-reserve` | Reserve namespace resources for a job |
+| `P2PCancelNamespaceReservation` | `nodedb-namespace-cancel` | Release a namespace reservation |
+| `P2PLookupDataObject` | `dor-lookup` | Ask a peer which of the given objects it holds |
+| `P2PFetchDataObject` | `dor-fetch` | Fetch object meta information and content |
+| `P2PPushDataObject` | `dor-push` | Push an object into a peer's DOR |
+| `P2PRelayPushDataObject` | `dor-relay-push` | Ask a custodian to relay a push to a third node |
+| `P2PRunnerPerformHandshake` | `rti-runner-handshake` | Runner/custodian handshake at job start |
+| `P2PPushJobStatus` | `rti-push-job-status` | Report job status back to the custodian |
+| `P2PInterruptJob` | `rti-interrupt-job` | Cancel a running job (served by the runner) |
+| `BatchBarrier` | `rti-batch-barrier` | Release a co-simulation barrier (served by the runner) |
+| `P2PNamespaceServiceCall` | `namespace-service-call` | Signed, authorised call into a node's DOR/RTI |
+| `P2PLatency` | `p2p-latency` | Round-trip latency probe |
+| `P2PThroughput` | `p2p-throughput` | Throughput probe using an attachment |
+
+`P2PNamespaceServiceCall` carries its own authorisation: the caller signs
+`SHA256(service ‖ method ‖ canonical_json(args))`, and the recipient verifies the signature
+against the caller's known identity before applying any per-method restrictions.
 
 ---
 
@@ -219,29 +263,35 @@ Network registry and discovery service for maintaining information about network
 ### Node Information Model
 
 ```python
-class NodeInfo:
-    identity: Identity              # Node's cryptographic identity
-    last_seen: int                  # Timestamp of last communication
+class NodeInfo(BaseModel):
+    identity: Identity                       # Node's cryptographic identity
+    last_seen: int                           # Timestamp of last communication
 
-    # Service capabilities
-    dor_service: bool               # Provides data storage
-    rti_service: bool               # Provides job execution
+    # Service capabilities: the backend in use, or 'none'
+    dor_service: str                         # e.g. 'basic' / 'none'
+    rti_service: str                         # e.g. 'docker' / 'none'
 
     # Network information
-    p2p_address: str                # P2P communication endpoint
-    rest_address: Tuple[str, int]   # REST API endpoint
+    p2p_address: str                         # e.g. 'tcp://127.0.0.1:4001'
+    rest_address: Optional[Tuple[str, int]]  # None if REST is disabled
+
+    # RTI-only flags
+    retain_job_history: Optional[bool]
+    strict_deployment: Optional[bool]
+
+    def has_dor(self) -> bool: ...           # dor_service set and not 'none'
+    def has_rti(self) -> bool: ...           # rti_service set and not 'none'
 ```
 
 ### Service Discovery
 
-```python
-def find_storage_nodes(self) -> List[NodeInfo]:
-    return self.nodedb.search_nodes(SearchCriteria(dor_service=True, online=True))
+The NodeDB holds the node's view of the network; filter it with the `NodeInfo` helpers:
 
-def find_execution_nodes(self, requirements: ResourceDescriptor) -> List[NodeInfo]:
-    return self.nodedb.search_nodes(SearchCriteria(
-        rti_service=True, online=True, min_resources=requirements
-    ))
+```python
+network: List[NodeInfo] = node.db.get_network()
+
+storage_nodes   = [n for n in network if n.has_dor()]
+execution_nodes = [n for n in network if n.has_rti()]
 ```
 
 ---

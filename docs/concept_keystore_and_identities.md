@@ -23,6 +23,8 @@ Each keystore contains the following core assets:
 - `content-keys`: A `ContentKeysAsset` for managing symmetric encryption keys.
 - `ssh-credentials`: An `SSHCredentialsAsset` storing SSH key-based credentials.
 - `github-credentials`: A `GithubCredentialsAsset` storing GitHub-related tokens.
+- `tls-cert`: A `TLSCertAsset` holding the self-signed X.509 certificate and private key used
+  for P2P connections.
 
 All assets except the master key are encrypted with the master key. The master key 
 itself is protected using a user-provided password.
@@ -31,7 +33,7 @@ itself is protected using a user-provided password.
 The keystore maintains a cryptographic identity that includes:
 - A unique ID (`iid`)
 - A profile (name and email)
-- Public keys (signing, encryption, and Curve-compatible)
+- Public keys (signing and encryption) and the TLS certificate
 - A nonce to track updates
 - A digital signature for integrity verification
 
@@ -52,11 +54,11 @@ The keystore supports the following methods for cryptographic operations:
 - `sign(message: bytes)`: Signs data using the signing key
 - `verify(message: bytes, signature: str)`: Verifies a signature
 
-### ZeroMQ Curve Support
-To support secure ZeroMQ communication:
-- A Curve-compatible secret key (`curve_secret_key`)
-- A corresponding public key (`curve_public_key`)
-are derived from the signing key.
+### TLS Certificate
+To support secure P2P communication, the keystore holds a self-signed X.509 certificate
+(EC P-256) together with its private key, reachable via `tls_cert_pem()`, `tls_key_pem()`
+and `tls_spki_hex()`. The certificate is published as part of the identity, so peers can
+pin it when connecting.
 
 ### Thread-Safety
 Access to internal state is guarded by a mutex (`Lock`) to support safe 
