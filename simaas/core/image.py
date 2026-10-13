@@ -109,7 +109,9 @@ def build_processor_image(processor_path: str, simaas_path: str, image_name: str
                 env = os.environ.copy()
                 env['DOCKER_BUILDKIT'] = '1'
 
-                subprocess.run(command, cwd=context_path, check=True, capture_output=True, text=True, env=env)
+                # build output is UTF-8; don't rely on the platform default encoding (e.g. cp1252 on Windows)
+                subprocess.run(command, cwd=context_path, check=True, capture_output=True, text=True,
+                               encoding='utf-8', errors='replace', env=env)
 
             except subprocess.CalledProcessError as e:
                 trace = ''.join(traceback.format_exception(None, e, e.__traceback__))
